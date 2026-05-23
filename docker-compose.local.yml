@@ -1,0 +1,135 @@
+services:
+
+  # GeoIP database updater
+  geoipupdate:
+    image: ghcr.io/maxmind/geoipupdate:v7.0.1
+    container_name: nt-geoipupdate
+    volumes:
+      - ./docker/geoip:/usr/share/GeoIP
+    environment:
+      GEOIPUPDATE_ACCOUNT_ID: ${MAXMIND_ACCOUNT_ID}
+      GEOIPUPDATE_LICENSE_KEY: ${MAXMIND_LICENSE_KEY}
+      GEOIPUPDATE_EDITION_IDS: GeoLite2-City GeoLite2-ASN
+      GEOIPUPDATE_FREQUENCY: 72
+    restart: unless-stopped
+
+  # Traffic generator
+  traffic-generator:
+    build:
+      context: ./docker/traffic-generator
+    container_name: nt-traffic-gen
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      TARGET_IP: ${TRAFFIC_TARGET_IP:-127.0.0.1}
+      PACKETS_PER_SECOND: ${TRAFFIC_PPS:-100}
+    restart: unless-stopped
+
+  # Capturing node (simulated)
+  capturing:
+    build:
+      context: ../capturing-node
+      dockerfile: Dockerfile.local
+    container_name: nt-capturing
+    network_mode: host      # needs host network to see loopback traffic
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    volumes:
+      - pcap-shared:/var/lib/network-telescope/data/raw
+    environment:
+      INTERFACE: ${CAPTURE_INTERFACE:-lo}
+      DATA_DIR: /var/lib/network-telescope/data/raw
+      DURATION: ${ROTATION_SECONDS:-60}
+      RING_BUFFER_SIZE: "0"
+      TRANSFER_MODE: local
+    depends_on:
+      - traffic-generator
+    restart: unless-stopped
+
+  # Processing pipeline (simulated)
+  processing:
+    build:
+      context: .
+      dockerfile: Dockerfile.local
+    container_name: nt-processing
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    volumes:
+      - pcap-shared:/var/lib/network-telescope/data/queue
+      - ./docker/geoip:/var/lib/geoip:ro
+    env_file: .env
+    environment:
+      # Override host-facing values with Docker-internal service names
+      CLICKHOUSE_HOST: clickhouse
+      PROMETHEUS_URL: http://prometheus:9090
+      PCAP_INBOX_DIR: /var/lib/network-telescope/data/queue
+    restart: unless-stopped
+
+  # ClickHouse
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: nt-clickhouse
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./docker/clickhouse/init-db:/docker-entrypoint-initdb.d:ro
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-telescope}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-telescope}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-change_me_in_production}
+    healthcheck:
+      test: ["CMD", "clickhouse-client",
+             "--user=${CLICKHOUSE_USER:-telescope}",
+             "--password=${CLICKHOUSE_PASSWORD:-change_me_in_production}",
+             "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    restart: unless-stopped
+
+  # Prometheus
+  prometheus:
+    image: prom/prometheus:v2.51.2
+    container_name: nt-prometheus
+    volumes:
+      - ./docker/prometheus/prometheus.local.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+  # Grafana
+  grafana:
+    build:
+      context: ./docker/grafana
+      dockerfile: Dockerfile
+    container_name: nt-grafana
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      prometheus:
+        condition: service_started
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-change_me_in_production}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-telescope}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-change_me_in_production}
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+
+volumes:
+  pcap-shared:
+  clickhouse-data:
+  prometheus-data:
+  grafana-data:

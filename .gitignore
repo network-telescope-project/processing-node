@@ -3,6 +3,8 @@ data
 venv
 .venv
 .idea
+.env
+docker/geoip
 
 # System files
 .DS_Store

@@ -1,0 +1,78 @@
+# TODO make sure "docker compose" sees and can read/load the environment variables
+services:
+  geoipupdate:
+    image: ghcr.io/maxmind/geoipupdate:v7.0.1
+    container_name: nt-geoipupdate
+    restart: always
+    volumes:
+      - ./geoip:/usr/share/GeoIP
+    environment:
+      GEOIPUPDATE_ACCOUNT_ID: ${MAXMIND_ACCOUNT_ID}
+      GEOIPUPDATE_LICENSE_KEY: ${MAXMIND_LICENSE_KEY}
+      GEOIPUPDATE_EDITION_IDS: GeoLite2-City GeoLite2-ASN
+      GEOIPUPDATE_FREQUENCY: 72
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: nt_clickhouse
+    restart: always
+    volumes:
+      - ./clickhouse/clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse/clickhouse_logs:/var/log/clickhouse-server
+      - ./clickhouse/init-db:/docker-entrypoint-initdb.d:ro
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+    healthcheck:
+      test: ["CMD", "clickhouse-client",
+             "--user=${CLICKHOUSE_USER}",
+             "--password=${CLICKHOUSE_PASSWORD}",
+             "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+    ports:
+      - "127.0.0.1:8123:8123"
+      - "127.0.0.1:9000:9000"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  prometheus:
+    image: prom/prometheus:v2.51.2
+    container_name: nt_prometheus
+    restart: always
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+
+  grafana:
+    build:
+      context: ./grafana
+      dockerfile: Dockerfile
+    container_name: nt_grafana
+    restart: always
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      prometheus:
+        condition: service_started
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-telescope}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-change_me_in_production}
+    ports:
+      - "3000:3000"
+
+volumes:
+  prometheus-data:
+  grafana-data:

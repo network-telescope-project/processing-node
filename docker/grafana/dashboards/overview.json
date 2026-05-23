@@ -1,0 +1,198 @@
+{
+  "id": null,
+  "uid": "nt-overview",
+  "title": "Network Telescope — Overview",
+  "tags": ["network-telescope"],
+  "timezone": "utc",
+  "refresh": "1m",
+  "schemaVersion": 38,
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+
+    {
+      "id": 1,
+      "title": "Packets / Second (24 h)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps",
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        }
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "targets": [{
+        "refId": "A",
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+        "rawSql": "SELECT count() / 300 AS value FROM telescope.packets WHERE ts >= now() - INTERVAL 24 HOUR",
+        "format": 0,
+        "queryType": "sql"
+      }]
+    },
+
+    {
+      "id": 2,
+      "title": "Total Packets (24 h)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }] }
+        }
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "targets": [{
+        "refId": "A",
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+        "rawSql": "SELECT count() AS value FROM telescope.packets WHERE ts >= now() - INTERVAL 24 HOUR",
+        "format": 0,
+        "queryType": "sql"
+      }]
+    },
+
+    {
+      "id": 3,
+      "title": "Unique Source IPs (24 h)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "purple", "value": null }] }
+        }
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "targets": [{
+        "refId": "A",
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+        "rawSql": "SELECT uniq(src_ip) AS value FROM telescope.packets WHERE ts >= now() - INTERVAL 24 HOUR",
+        "format": 0,
+        "queryType": "sql"
+      }]
+    },
+
+    {
+      "id": 4,
+      "title": "PPS Drop Alerts (24 h)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null },
+            { "color": "red", "value": 1 }
+          ]}
+        }
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "targets": [{
+        "refId": "A",
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+        "rawSql": "SELECT countIf(pps_drop_alert) AS value FROM telescope.telescope_health WHERE ts >= now() - INTERVAL 24 HOUR",
+        "format": 0,
+        "queryType": "sql"
+      }]
+    },
+
+    {
+      "id": 5,
+      "title": "Packets Over Time (by protocol)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 4 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "options": { "tooltip": { "mode": "multi" } },
+      "targets": [{
+        "refId": "A",
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+        "rawSql": "SELECT toStartOfMinute(ts) AS time, protocol, count() AS packets FROM telescope.packets WHERE $__timeFilter(ts) GROUP BY time, protocol ORDER BY time ASC",
+        "format": 1,
+        "queryType": "sql"
+      }]
+    },
+
+    {
+      "id": 6,
+      "title": "Top Source Countries",
+      "type": "piechart",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+      "options": { "pieType": "pie", "tooltip": { "mode": "single" } },
+      "targets": [{
+        "refId": "A",
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+        "rawSql": "SELECT src_country_name AS name, count() AS value FROM telescope.packets WHERE $__timeFilter(ts) AND src_country_name != '' GROUP BY src_country_name ORDER BY value DESC LIMIT 15",
+        "format": 0,
+        "queryType": "sql"
+      }]
+    },
+
+    {
+      "id": 7,
+      "title": "Top Destination Ports",
+      "type": "bargauge",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "options": { "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{
+        "refId": "A",
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+        "rawSql": "SELECT toString(dst_port) AS name, count() AS value FROM telescope.packets WHERE $__timeFilter(ts) AND dst_port IS NOT NULL GROUP BY dst_port ORDER BY value DESC LIMIT 20",
+        "format": 0,
+        "queryType": "sql"
+      }]
+    },
+
+    {
+      "id": 8,
+      "title": "NIC Drop Rates (capturing node)",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 20 },
+      "datasource": { "type": "prometheus", "uid": "prometheus-telescope" },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus-telescope" },
+          "expr": "rate(node_ethtool_rx_dropped_total[5m])",
+          "legendFormat": "rx_dropped/s"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus-telescope" },
+          "expr": "rate(node_ethtool_rx_missed_errors_total[5m])",
+          "legendFormat": "rx_missed/s"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "prometheus-telescope" },
+          "expr": "rate(node_ethtool_rx_fifo_errors_total[5m])",
+          "legendFormat": "rx_fifo/s"
+        }
+      ]
+    },
+
+    {
+      "id": 9,
+      "title": "Capture Node Health - Disk Available",
+      "type": "timeseries",
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 20},
+      "datasource": {"type": "prometheus", "uid": "prometheus-telescope"},
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [{
+        "refID": "A",
+        "datasource": {"type": "prometheus", "uid": "prometheus-telescope"},
+        "expr": "node_filesystem_avail_bytes{job='capturing-node'}",
+        "legendFormat": "Available bytes"
+      }]
+    }
+
+  ]
+}

@@ -1,0 +1,28 @@
+global:
+  scrape_interval: 60s
+  evaluation_interval: 60s
+
+# TODO configure Alertmanager later
+
+scrape_configs:
+
+  # Prometheus self-monitoring
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Capturing Node (prometheus-node-exporter)
+  - job_name: capturing-node
+    static_configs:
+      - targets: ['${CAPTURING_NODE_IP}:${CAPTURING_NODE_EXPORTER_PORT}']
+    relabel_configs:
+      - target_label: node
+        replacement: capturing
+
+  # Processing pipeline
+  - job_name: processing-pipeline
+    static_configs:
+      - targets: ['localhost:${METRICS_PORT}']
+    relabel_configs:
+      - target_label: node
+        replacement: processing
