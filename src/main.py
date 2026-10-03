@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env")
 
 from prometheus_client import start_http_server as _start_metrics_server
-from src.parser.pcap_parser import PcapParser
+from src.parser.pcap_parser import PcapParser, PcapParseError
 from src.enricher.metadata_enricher import MetadataEnricher
 from src.lifecycle.data_lifecycle_manager import DataLifecycleManager
 from src.health.health_monitoring_manager import HealthMonitoringManager
@@ -39,15 +39,20 @@ def process_pcap_file(
 ) -> None:
     logger.info(f"Processing: {filepath.name}")
     try:
-        packets = parser.parse(filepath)
+        try:
+            packets = parser.parse(filepath)
+        except PcapParseError as e:
+            lifecycle.quarantine_pcap(filepath, str(e))
+            return
+
         if not packets:
-            logger.info(f"No packets in {filepath.name}, skipping.")
-            filepath.unlink(missing_ok=True)
+            logger.info(f"No IP packets in {filepath.name}, archiving.")
+            lifecycle.archive_pcap(filepath)
             return
 
         enriched = enricher.enrich_batch(packets)
         lifecycle.save_batch(enriched)
-        lifecycle.cleanup_pcap(filepath)
+        lifecycle.archive_pcap(filepath)
         logger.info(f"Done: {filepath.name} - {len(enriched)} packets ingested.")
     except Exception as e:
         logger.exception(f"Failed to process {filepath.name}: {e}")
@@ -82,6 +87,9 @@ def scan_inbox(
     for filepath in sorted(candidates):
         process_pcap_file(filepath, parser, enricher, lifecycle)
 
+    # Files are removed from quarantine by hand once looked at
+    lifecycle.update_quarantine_gauge()
+
 
 def main() -> None:
     logger.info("=== Network Telescope - Processing Node Starting ===")
@@ -97,7 +105,12 @@ def main() -> None:
     lifecycle = DataLifecycleManager(db)
     health_mgr = HealthMonitoringManager(db)
 
+    lifecycle.ensure_dirs(PCAP_INBOX_DIR)
+    lifecycle.maintain_archive()
+
     schedule.every(5).minutes.do(health_mgr.run)
+    # Age limit (also covers days without new files); size and free-disk limits run after each archived file
+    schedule.every().hour.do(lifecycle.maintain_archive)
 
     # Graceful shutdown
     shutdown = {"requested": False}

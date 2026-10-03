@@ -68,6 +68,7 @@ class HealthMonitoringManager:
         m["rx_fifo_rate"] = self._q("rate(node_ethtool_rx_fifo_errors_total[5m])")
         m["udp_rx_errors"] = self._q("node_netstat_Udp_RxErrors")
 
+        # TODO make these queries adaptive rather than hardcoded
         # Disk health
         capture_mount = os.environ.get("CAPTURE_MOUNTPOINT", "/var/lib/network-telescope")
         m["disk_avail_bytes"] = self._q(f'node_filesystem_avail_bytes{{mountpoint="{capture_mount}"}}')

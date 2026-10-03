@@ -18,6 +18,10 @@ def _load_scapy():
         _scapy_loaded = True
 
 
+class PcapParseError(Exception):
+    """The file could not be read as a PCAP (corrupt, truncated, wrong format)."""
+
+
 PROTO_MAP = {6: "TCP", 17: "UDP"}
 
 IPV6_EXT_HEADERS = {0: "HOPOPT", 43: "ROUTING", 44: "FRAGMENT", 51: "AH", 50: "ESP", 60: "DESTOPTIONS"}
@@ -130,8 +134,7 @@ class PcapParser:
                     if record is not None:
                         records.append(record)
         except Exception as e:
-            logger.error(f"Error reading {filepath}: {e}")
-            return []
+            raise PcapParseError(f"Error reading {filepath.name}: {e}") from e
 
         logger.info(f"Parsed {len(records)} IP packets from {filepath.name}")
         return records

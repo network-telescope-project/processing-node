@@ -22,7 +22,7 @@ scrape_configs:
   # Processing pipeline
   - job_name: processing-pipeline
     static_configs:
-      - targets: ['localhost:${METRICS_PORT}']
+      - targets: ['host.docker.internal:${METRICS_PORT}']
     relabel_configs:
       - target_label: node
         replacement: processing

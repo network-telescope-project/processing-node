@@ -10,6 +10,8 @@ NT_USER="telescope"
 NT_GROUP="telescope"
 
 DATA_DIR="/var/lib/network-telescope/data/queue"
+ARCHIVE_DIR="/var/lib/network-telescope/data/archive"
+QUARANTINE_DIR="/var/lib/network-telescope/data/quarantine"
 CONF_DIR="/etc/network-telescope"
 VENV_DIR="${PROJECT_ROOT}/.venv"
 ENV_FILE="${PROJECT_ROOT}/.env"
@@ -37,7 +39,6 @@ if [[ ! "${OS}" =~ ^(ubuntu|debian)$ ]]; then
 fi
 
 # --Dependencies--------------------------------------------------------------
-# TODO docker V1 instead of V2
 SYSTEM_DEPS=("python3" "python3-venv" "python3-pip" "libpcap-dev" "curl" "git" "rsync" "openssh-server" "ufw" "jq" "gettext-base")
 MISSING_DEPS=()
 
@@ -99,8 +100,8 @@ if ! groups "$NT_USER" | grep -q "\bdocker\b"; then
     warn "Note: You may need to log out and back in for docker group changes to take effect."
 fi
 
-mkdir -p "${DATA_DIR}" "${CONF_DIR}"
-chown -R "${NT_USER}:${NT_USER}" "${DATA_DIR}"
+mkdir -p "${DATA_DIR}" "${ARCHIVE_DIR}" "${QUARANTINE_DIR}" "${CONF_DIR}"
+chown -R "${NT_USER}:${NT_USER}" "${DATA_DIR}" "${ARCHIVE_DIR}" "${QUARANTINE_DIR}"
 
 # Docker bind-mount dirs
 DOCKER_DIR="${PROJECT_ROOT}/docker"
@@ -137,6 +138,7 @@ else
 fi
 
 # --prometheus.yml from template---------------------------------------------
+# TODO remake this to generate prometheus.yml with correct Capturing Node internal IPs
 PROM_TEMPLATE="${DOCKER_DIR}/prometheus/prometheus.yml.template"
 PROM_OUT="${DOCKER_DIR}/prometheus/prometheus.yml"
 if [[ -f "${ENV_FILE}" ]]; then
@@ -166,7 +168,17 @@ warn "ssh-copy-id -i ~/.ssh/id_ed25519.pub ${NT_USER}@<THIS_NODE_IP>"
 echo ""
 
 # --Firewall-----------------------------------------------------------------
+# TODO grafana dashboard is complete shit - has to be remade
 # TODO implement firewall later
+# TODO: Configure firewall rules for production deployment:
+#   ufw allow from <CAPTURING_NODE_IP> to any port 22        # SSH from capturing node (if needed)
+#   ufw allow from 172.16.0.0/12 to any port 8000           # Prometheus scraping of processing pipeline metrics
+#                                                             # (Docker bridge subnet - needed for Prometheus container
+#                                                             #  to reach nt-processing metrics on the host)
+#   ufw allow from <YOUR_MANAGEMENT_IP> to any port 3000     # Grafana (or use SSH tunnel only)
+#   ufw allow from <YOUR_MANAGEMENT_IP> to any port 9090     # Prometheus UI (or use SSH tunnel only)
+#   ufw default deny incoming
+#   ufw enable
 
 # --Systemd service for processing-------------------------------------------
 cat > /etc/systemd/system/nt-processing.service <<EOF
