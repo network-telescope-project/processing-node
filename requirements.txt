@@ -5,3 +5,4 @@ maxminddb==2.6.0
 prometheus-client==0.20.0
 python-dotenv==1.0.1
 schedule==1.2.2
+zstandard==0.25.0

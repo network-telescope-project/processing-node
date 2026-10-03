@@ -1,7 +1,7 @@
 {
   "id": null,
   "uid": "nt-overview",
-  "title": "Network Telescope — Overview",
+  "title": "Network Telescope - Overview",
   "tags": ["network-telescope"],
   "timezone": "utc",
   "refresh": "1m",

@@ -6,6 +6,9 @@ set -euo pipefail
 SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
 PROJECT_ROOT=$(dirname "$SCRIPT_DIR")
 
+NT_USER="telescope"
+NT_GROUP="telescope"
+
 DATA_DIR="${PCAP_INBOX_DIR:-/var/lib/network-telescope/data/queue}"
 CONF_DIR="/etc/network-telescope"
 VENV_DIR="${PROJECT_ROOT}/.venv"
@@ -13,9 +16,6 @@ ENV_FILE="${PROJECT_ROOT}/.env"
 SSH_DIR="/home/${NT_USER}/.ssh"
 DOCKER_DIR="${PROJECT_ROOT}/docker"
 COMPOSE_FILE="${DOCKER_DIR}/docker-compose.yml"
-
-NT_USER="telescope"
-NT_GROUP="telescope"
 
 # --Helpers-------------------------------------------------------------------
 log()  { echo "[*] $*"; }
@@ -136,6 +136,12 @@ if [[ -d "${DATA_DIR}" ]]; then
 else
     err "PCAP inbox missing: ${DATA_DIR}"
     ERRORS=$(( ERRORS + 1 ))
+fi
+
+QUARANTINE_DIR="${PCAP_QUARANTINE_DIR:-/var/lib/network-telescope/data/quarantine}"
+if [[ -d "${QUARANTINE_DIR}" ]]; then
+    QUARANTINED=$(find "${QUARANTINE_DIR}" -name "*.pcap" 2>/dev/null | wc -l)
+    [[ ${QUARANTINED} -gt 0 ]] && warn "${QUARANTINED} PCAP file(s) in quarantine (failed to parse): ${QUARANTINE_DIR}"
 fi
 
 # --Systemd service-----------------------------------------------------------
