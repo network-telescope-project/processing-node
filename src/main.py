@@ -8,14 +8,19 @@ from pathlib import Path
 import schedule
 from dotenv import load_dotenv
 
-# Load .env before importing modules that use env vars
 load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env")
 
 from prometheus_client import start_http_server as _start_metrics_server
 from src.parser.pcap_parser import PcapParser, PcapParseError
 from src.enricher.metadata_enricher import MetadataEnricher
-from src.lifecycle.data_lifecycle_manager import DataLifecycleManager
+from src.lifecycle.data_lifecycle_manager import (
+    DataLifecycleManager,
+    PCAP_ARCHIVE_DIR,
+    PCAP_QUARANTINE_DIR,
+    file_sha256,
+)
 from src.health.health_monitoring_manager import HealthMonitoringManager
+from src.health.ingest_watchdog import IngestWatchdog
 from src.db import get_client
 
 logging.basicConfig(
@@ -39,19 +44,34 @@ def process_pcap_file(
 ) -> None:
     logger.info(f"Processing: {filepath.name}")
     try:
+        sha256 = file_sha256(filepath)
+
+        try:
+            already_done = lifecycle.already_ingested(sha256)
+        except Exception as e:
+            logger.warning(f"Could not check the ingest log for {filepath.name}: {e}")
+            already_done = False
+        if already_done:
+            logger.info(f"{filepath.name} is already in the ingest log, archiving without ingesting it again.")
+            lifecycle.archive_pcap(filepath)
+            return
+
         try:
             packets = parser.parse(filepath)
         except PcapParseError as e:
-            lifecycle.quarantine_pcap(filepath, str(e))
+            lifecycle.quarantine_pcap(filepath, str(e), sha256)
             return
 
         if not packets:
             logger.info(f"No IP packets in {filepath.name}, archiving.")
+            lifecycle.log_file(filepath, sha256, "empty")
             lifecycle.archive_pcap(filepath)
             return
 
         enriched = enricher.enrich_batch(packets)
-        lifecycle.save_batch(enriched)
+        lifecycle.remove_partial_rows(filepath.name)
+        lifecycle.save_batch(enriched, filepath.name)
+        lifecycle.log_file(filepath, sha256, "ingested", packets=enriched)
         lifecycle.archive_pcap(filepath)
         logger.info(f"Done: {filepath.name} - {len(enriched)} packets ingested.")
     except Exception as e:
@@ -108,8 +128,11 @@ def main() -> None:
     lifecycle.ensure_dirs(PCAP_INBOX_DIR)
     lifecycle.maintain_archive()
 
+    watchdog = IngestWatchdog(PCAP_INBOX_DIR, PCAP_ARCHIVE_DIR, PCAP_QUARANTINE_DIR)
+    watchdog.run()
+
     schedule.every(5).minutes.do(health_mgr.run)
-    # Age limit (also covers days without new files); size and free-disk limits run after each archived file
+    schedule.every(5).minutes.do(watchdog.run)
     schedule.every().hour.do(lifecycle.maintain_archive)
 
     # Graceful shutdown

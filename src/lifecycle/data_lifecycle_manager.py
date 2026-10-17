@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import logging
 import os
 import shutil
@@ -30,6 +31,10 @@ PCAPS_QUARANTINED = Counter(
 QUARANTINE_FILES = Gauge(
     "telescope_quarantine_files",
     "PCAP files currently waiting in the quarantine directory",
+)
+QUARANTINE_BYTES = Gauge(
+    "telescope_quarantine_bytes",
+    "Total size of the PCAP files in the quarantine directory in bytes",
 )
 ARCHIVE_FILES = Gauge("telescope_archive_files", "Files in the PCAP archive")
 ARCHIVE_BYTES = Gauge("telescope_archive_bytes", "Total size of the PCAP archive in bytes")
@@ -61,7 +66,15 @@ COLUMNS = [
     "src_country_code",
     "src_country_name",
     "src_city",
+    "pcap_file",
 ]
+
+LOG_COLUMNS = [
+    "ingested_at", "file_name", "file_sha256", "file_size", "ts_min", "ts_max", "frames", "parsed",
+    "non_ip", "malformed", "duplicates", "inserted", "geoip_build", "tool_version", "status", "message",
+]
+TOOL_VERSION = "nt-processing"
+DONE_STATUSES = ("ingested", "empty")
 
 INSERT_BATCH_SIZE = int(os.environ.get("INSERT_BATCH_SIZE", "10000"))
 INGESTION_DROP_THRESHOLD = float(os.environ.get("INGESTION_DROP_THRESHOLD", "0.90"))
@@ -88,7 +101,15 @@ def _move(src: Path, dest: Path) -> None:
         src.unlink()
 
 
-def _to_row(pkt: dict[str, Any]) -> list:
+def file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _to_row(pkt: dict[str, Any], pcap_file: str) -> list:
     return [
         pkt.get("ts") or datetime.now(tz=timezone.utc),
         pkt.get("ip_version") or 0,
@@ -106,6 +127,7 @@ def _to_row(pkt: dict[str, Any]) -> list:
         pkt.get("src_country_code") or "",
         pkt.get("src_country_name") or "",
         pkt.get("src_city") or "",
+        pcap_file,
     ]
 
 
@@ -117,7 +139,46 @@ class DataLifecycleManager:
         self._archive_dir = PCAP_ARCHIVE_DIR
         self._quarantine_dir = PCAP_QUARANTINE_DIR
 
-    def save_batch(self, packets: list[dict[str, Any]]) -> int:
+    def already_ingested(self, sha256: str) -> bool:
+        done = ", ".join(f"'{s}'" for s in DONE_STATUSES)
+        res = self._db.query(
+            f"SELECT count() FROM pcap_ingest_log WHERE file_sha256 = {{s:String}} AND status IN ({done})",
+            parameters={"s": sha256},
+        )
+        return res.result_rows[0][0] > 0
+
+    def remove_partial_rows(self, pcap_file: str) -> None:
+        """Delete rows left by mid-insert crashed attempt, so retrying the file doesn't duplicate them."""
+        res = self._db.query(
+            "SELECT count() FROM packets WHERE pcap_file = {f:String}", parameters={"f": pcap_file}
+        )
+        n = res.result_rows[0][0]
+        if n:
+            logger.warning(f"{pcap_file}: removing {n} rows of an unfinished earlier attempt before re-ingesting")
+            self._db.command(
+                "ALTER TABLE packets DELETE WHERE pcap_file = {f:String}",
+                parameters={"f": pcap_file},
+                settings={"mutations_sync": 1},
+            )
+
+    def log_file(
+        self,
+        filepath: Path,
+        sha256: str,
+        status: str,
+        packets: list[dict[str, Any]] | None = None,
+        message: str = "",
+    ) -> None:
+        stamps = [p["ts"] for p in packets or [] if p.get("ts")]
+        n = len(packets or [])
+        row = [
+            datetime.now(tz=timezone.utc), filepath.name, sha256, filepath.stat().st_size,
+            min(stamps) if stamps else None, max(stamps) if stamps else None,
+            n, n, 0, 0, 0, n, "", TOOL_VERSION, status, message,
+        ]
+        self._db.insert("pcap_ingest_log", [row], column_names=LOG_COLUMNS)
+
+    def save_batch(self, packets: list[dict[str, Any]], pcap_file: str = "") -> int:
         if not packets:
             return 0
 
@@ -126,7 +187,7 @@ class DataLifecycleManager:
 
         for i in range(0, len(packets), INSERT_BATCH_SIZE):
             chunk = packets[i : i + INSERT_BATCH_SIZE]
-            rows = [_to_row(p) for p in chunk]
+            rows = [_to_row(p, pcap_file) for p in chunk]
             try:
                 self._db.insert("packets", rows, column_names=COLUMNS)
                 total += len(rows)
@@ -192,7 +253,7 @@ class DataLifecycleManager:
         logger.info(f"Archived: {filepath.name}")
         self.maintain_archive()
 
-    def quarantine_pcap(self, filepath: Path, reason: str) -> None:
+    def quarantine_pcap(self, filepath: Path, reason: str, sha256: str = "") -> None:
         """Keep a file that could not be parsed, untouched, for later inspection."""
         dest = self._quarantine_dir / filepath.name
         try:
@@ -205,6 +266,11 @@ class DataLifecycleManager:
             logger.error(f"Could not quarantine {filepath.name}: {e}")
             return
 
+        try:
+            self.log_file(dest, sha256, "quarantined", message=reason)
+        except Exception as e:
+            logger.warning(f"Could not write the ingest log row for {dest.name}: {e}")
+
         PCAPS_QUARANTINED.inc()
         self.update_quarantine_gauge()
         msg = f"[Network Telescope] PCAP QUARANTINED: {filepath.name} - {reason}"
@@ -212,7 +278,9 @@ class DataLifecycleManager:
         self._send_alert(msg)
 
     def update_quarantine_gauge(self) -> None:
-        QUARANTINE_FILES.set(sum(1 for _ in self._quarantine_dir.glob("*.pcap")))
+        files = list(self._quarantine_dir.glob("*.pcap"))
+        QUARANTINE_FILES.set(len(files))
+        QUARANTINE_BYTES.set(sum(f.stat().st_size for f in files))
 
     def maintain_archive(self) -> None:
         """Compress leftovers, then enforce retention (age, size cap, minimum free disk)."""

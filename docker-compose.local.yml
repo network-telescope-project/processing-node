@@ -31,7 +31,7 @@ services:
   capturing:
     build:
       context: ../capturing-node
-      dockerfile: Dockerfile.local
+      dockerfile: local/Dockerfile.local
     container_name: nt-capturing
     network_mode: host      # needs host network to see loopback traffic
     cap_add:

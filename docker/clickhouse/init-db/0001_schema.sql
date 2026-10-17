@@ -19,11 +19,37 @@ CREATE TABLE IF NOT EXISTS telescope.packets (
     src_asn_name String,
     src_country_code LowCardinality(String),
     src_country_name LowCardinality(String),
-    src_city String
+    src_city String,
+    pcap_file LowCardinality(String),
+    INDEX idx_pcap_file pcap_file TYPE bloom_filter GRANULARITY 4
 ) ENGINE = MergeTree()
 PARTITION BY toYYYYMMDD(ts)
 ORDER BY (ts, dst_port)
 SETTINGS allow_nullable_key = 1;    -- TODO deal with the nullable bullshit later
+
+
+-- One row per handled PCAP file (ingested, empty or quarantined)
+CREATE TABLE IF NOT EXISTS telescope.pcap_ingest_log
+(
+    ingested_at  DateTime64(3, 'UTC'),
+    file_name    String,
+    file_sha256  String,
+    file_size    UInt64,
+    ts_min       Nullable(DateTime64(3, 'UTC')),
+    ts_max       Nullable(DateTime64(3, 'UTC')),
+    frames       UInt32,
+    parsed       UInt32,
+    non_ip       UInt32,
+    malformed    UInt32,
+    duplicates   UInt32,
+    inserted     UInt32,
+    geoip_build  String,
+    tool_version String,
+    status       LowCardinality(String),
+    message      String DEFAULT ''
+)
+ENGINE = MergeTree
+ORDER BY (file_sha256, ingested_at);
 
 
 -- Telescope Health table
