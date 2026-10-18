@@ -10,9 +10,10 @@ import requests
 import zstandard
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 from prometheus_client import Counter, Gauge
+
+from src.parser.pcap_parser import PARSER_VERSION, Packet, ParseStats
 
 logger = logging.getLogger(__name__)
 
@@ -49,34 +50,26 @@ ARCHIVE_ERRORS = Counter(
     ["stage"],  # move | compress | quarantine
 )
 
-COLUMNS = [
-    "ts",
-    "ip_version",
-    "src_ip",
-    "dst_ip",
-    "src_port",
-    "dst_port",
-    "protocol",
-    "ttl",
-    "length",
-    "flags",
-    "tcp_window",
-    "src_asn",
-    "src_asn_name",
-    "src_country_code",
-    "src_country_name",
-    "src_city",
-    "pcap_file",
+COLUMNS = [*Packet._fields, "pcap_file"]
+COLUMN_TYPES = [
+    "DateTime64(6, 'UTC')", "UInt32", "UInt32", "UInt16", "UInt16", "UInt8", "UInt16", "UInt16", "UInt8", "UInt8",
+    "UInt16", "UInt32", "UInt32", "LowCardinality(String)", "UInt16", "UInt8", "UInt16", "LowCardinality(String)",
+]
+
+SOURCE_COLUMNS = ["ip", "asn", "asn_name", "country_code", "country_name", "city"]
+SOURCE_COLUMN_TYPES = [
+    "UInt32", "UInt32", "LowCardinality(String)", "LowCardinality(String)", "LowCardinality(String)", "String",
 ]
 
 LOG_COLUMNS = [
     "ingested_at", "file_name", "file_sha256", "file_size", "ts_min", "ts_max", "frames", "parsed",
-    "non_ip", "malformed", "duplicates", "inserted", "geoip_build", "tool_version", "status", "message",
+    "non_ip", "non_tcp", "out_of_scope", "malformed", "duplicates", "inserted", "tool_version", "status", "message",
 ]
-TOOL_VERSION = "nt-processing"
+TOOL_VERSION = f"nt-processing/{PARSER_VERSION}"
 DONE_STATUSES = ("ingested", "empty")
 
 INSERT_BATCH_SIZE = int(os.environ.get("INSERT_BATCH_SIZE", "10000"))
+SOURCE_LOOKUP_BATCH = 5000      # addresses per "which sources are new" query
 INGESTION_DROP_THRESHOLD = float(os.environ.get("INGESTION_DROP_THRESHOLD", "0.90"))
 
 PCAP_ARCHIVE_DIR = Path(os.environ.get("PCAP_ARCHIVE_DIR", "/var/lib/network-telescope/data/archive"))
@@ -107,28 +100,6 @@ def file_sha256(path: Path) -> str:
         for block in iter(lambda: f.read(1024 * 1024), b""):
             h.update(block)
     return h.hexdigest()
-
-
-def _to_row(pkt: dict[str, Any], pcap_file: str) -> list:
-    return [
-        pkt.get("ts") or datetime.now(tz=timezone.utc),
-        pkt.get("ip_version") or 0,
-        pkt.get("src_ip") or "",
-        pkt.get("dst_ip") or "",
-        pkt.get("src_port"),
-        pkt.get("dst_port"),
-        pkt.get("protocol") or "OTHER",
-        pkt.get("ttl") or 0,
-        pkt.get("length") or 0,
-        str(pkt.get("flags") or ""),
-        pkt.get("tcp_window") or 0,
-        str(pkt.get("src_asn") or ""),
-        pkt.get("src_asn_name") or "",
-        pkt.get("src_country_code") or "",
-        pkt.get("src_country_name") or "",
-        pkt.get("src_city") or "",
-        pcap_file,
-    ]
 
 
 class DataLifecycleManager:
@@ -166,44 +137,56 @@ class DataLifecycleManager:
         filepath: Path,
         sha256: str,
         status: str,
-        packets: list[dict[str, Any]] | None = None,
+        stats: ParseStats | None = None,
+        inserted: int = 0,
         message: str = "",
     ) -> None:
-        stamps = [p["ts"] for p in packets or [] if p.get("ts")]
-        n = len(packets or [])
+        s = stats or ParseStats()
         row = [
             datetime.now(tz=timezone.utc), filepath.name, sha256, filepath.stat().st_size,
-            min(stamps) if stamps else None, max(stamps) if stamps else None,
-            n, n, 0, 0, 0, n, "", TOOL_VERSION, status, message,
+            s.ts_min, s.ts_max, s.frames, s.parsed, s.non_ip, s.non_tcp, s.out_of_scope, s.malformed, 0, inserted,
+            TOOL_VERSION, status, message,
         ]
         self._db.insert("pcap_ingest_log", [row], column_names=LOG_COLUMNS)
 
-    def save_batch(self, packets: list[dict[str, Any]], pcap_file: str = "") -> int:
+    def save_batch(self, packets: list[Packet], pcap_file: str) -> int:
+        """Insert one chunk of parsed packets."""
         if not packets:
             return 0
+        rows = [(*p, pcap_file) for p in packets]
+        try:
+            self._db.insert("packets", rows, column_names=COLUMNS, column_type_names=COLUMN_TYPES)
+        except Exception as e:
+            logger.error(f"ClickHouse insert failed: {e}")
+            raise
+        PACKETS_INGESTED.inc(len(rows))
+        logger.debug(f"Inserted {len(rows)} rows into ClickHouse.")
+        return len(rows)
 
-        total = 0
-        t_start = time.monotonic()
+    def unknown_sources(self, ips: set[int]) -> list[int]:
+        """The source addresses (as integers) that have no row in source_enrichment yet."""
+        known: set[int] = set()
+        ordered = sorted(ips)
+        for i in range(0, len(ordered), SOURCE_LOOKUP_BATCH):
+            res = self._db.query(
+                "SELECT toUInt32(ip) FROM source_enrichment WHERE toUInt32(ip) IN {ips:Array(UInt32)}",
+                parameters={"ips": ordered[i : i + SOURCE_LOOKUP_BATCH]},
+            )
+            known.update(row[0] for row in res.result_rows)
+        return [ip for ip in ordered if ip not in known]
 
-        for i in range(0, len(packets), INSERT_BATCH_SIZE):
-            chunk = packets[i : i + INSERT_BATCH_SIZE]
-            rows = [_to_row(p, pcap_file) for p in chunk]
-            try:
-                self._db.insert("packets", rows, column_names=COLUMNS)
-                total += len(rows)
-                PACKETS_INGESTED.inc(len(rows))
-                logger.debug(f"Inserted {len(rows)} rows into ClickHouse.")
-            except Exception as e:
-                logger.error(f"ClickHouse insert failed: {e}")
-                raise
+    def save_sources(self, rows: list[list]) -> None:
+        if rows:
+            self._db.insert(
+                "source_enrichment", rows, column_names=SOURCE_COLUMNS, column_type_names=SOURCE_COLUMN_TYPES
+            )
 
-        elapsed = time.monotonic() - t_start
-        if elapsed > 0 and total > 0:
-            current_pps = total / elapsed
+    def check_ingestion_speed(self, inserted: int, elapsed: float) -> None:
+        """Compares the speed of this file (parse + enrich + insert) with the previous one."""
+        if elapsed > 0 and inserted > 0:
+            current_pps = inserted / elapsed
             self._check_ingestion_drop(current_pps)
             self._last_ingestion_pps = current_pps
-
-        return total
 
     def _check_ingestion_drop(self, current_pps: float) -> None:
         if self._last_ingestion_pps is None or self._last_ingestion_pps == 0:

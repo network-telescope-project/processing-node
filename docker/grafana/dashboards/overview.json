@@ -102,7 +102,7 @@
 
     {
       "id": 5,
-      "title": "Packets Over Time (by protocol)",
+      "title": "Packets Over Time (by destination IP)",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 4 },
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
@@ -111,7 +111,7 @@
       "targets": [{
         "refId": "A",
         "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
-        "rawSql": "SELECT toStartOfMinute(ts) AS time, protocol, count() AS packets FROM telescope.packets WHERE $__timeFilter(ts) GROUP BY time, protocol ORDER BY time ASC",
+        "rawSql": "SELECT toStartOfMinute(ts) AS time, toString(dst_ip) AS dst_ip, count() AS packets FROM telescope.packets WHERE $__timeFilter(ts) GROUP BY time, dst_ip ORDER BY time ASC",
         "format": 1,
         "queryType": "sql"
       }]
@@ -127,7 +127,7 @@
       "targets": [{
         "refId": "A",
         "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
-        "rawSql": "SELECT src_country_name AS name, count() AS value FROM telescope.packets WHERE $__timeFilter(ts) AND src_country_name != '' GROUP BY src_country_name ORDER BY value DESC LIMIT 15",
+        "rawSql": "SELECT e.country_name AS name, count() AS value FROM telescope.packets AS p INNER JOIN telescope.source_enrichment AS e ON p.src_ip = e.ip WHERE $__timeFilter(p.ts) AND e.country_name != '' GROUP BY e.country_name ORDER BY value DESC LIMIT 15",
         "format": 0,
         "queryType": "sql"
       }]
@@ -144,7 +144,7 @@
       "targets": [{
         "refId": "A",
         "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
-        "rawSql": "SELECT toString(dst_port) AS name, count() AS value FROM telescope.packets WHERE $__timeFilter(ts) AND dst_port IS NOT NULL GROUP BY dst_port ORDER BY value DESC LIMIT 20",
+        "rawSql": "SELECT toString(dst_port) AS name, count() AS value FROM telescope.packets WHERE $__timeFilter(ts) GROUP BY dst_port ORDER BY value DESC LIMIT 20",
         "format": 0,
         "queryType": "sql"
       }]
