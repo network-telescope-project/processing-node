@@ -3,10 +3,11 @@ from __future__ import annotations
 import ipaddress
 import logging
 import os
+import socket
 import time
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import maxminddb
 
@@ -30,7 +31,7 @@ def _is_private(ip: str) -> bool:
 
 
 class MetadataEnricher:
-    """Adds GeoIP/ASN fields to parsed packet records."""
+    """Looks up GeoIP/ASN fields of source addresses"""
 
     def __init__(self):
         self._cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
@@ -119,25 +120,23 @@ class MetadataEnricher:
 
         return geo
 
-    def enrich_batch(self, packets: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        if not packets:
-            return packets
-
+    def enrich_sources(self, ips: Iterable[int]) -> list[list]:
         self._reload()
+        if self._city_reader is None or self._asn_reader is None:
+            return []
 
-        enriched = []
-        for pkt in packets:
-            geo = self._lookup(pkt.get("src_ip", ""))
-            enriched.append({
-                **pkt,
-                "src_country_code": geo["country_code"],
-                "src_country_name": geo["country_name"],
-                "src_city": geo["city"],
-                "src_asn": geo["asn"],
-                "src_asn_name": geo["asn_name"],
-            })
-
-        return enriched
+        rows = []
+        for ip in ips:
+            geo = self._lookup(socket.inet_ntoa(ip.to_bytes(4, "big")))
+            rows.append([
+                ip,
+                int(geo["asn"] or 0),
+                geo["asn_name"],
+                geo["country_code"],
+                geo["country_name"],
+                geo["city"],
+            ])
+        return rows
 
     def close(self) -> None:
         if self._city_reader:

@@ -11,10 +11,11 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env")
 
 from prometheus_client import start_http_server as _start_metrics_server
-from src.parser.pcap_parser import PcapParser, PcapParseError
+from src.parser.pcap_parser import Darknet, ParseStats, PcapParser, PcapParseError
 from src.enricher.metadata_enricher import MetadataEnricher
 from src.lifecycle.data_lifecycle_manager import (
     DataLifecycleManager,
+    INSERT_BATCH_SIZE,
     PCAP_ARCHIVE_DIR,
     PCAP_QUARANTINE_DIR,
     file_sha256,
@@ -56,24 +57,34 @@ def process_pcap_file(
             lifecycle.archive_pcap(filepath)
             return
 
+        lifecycle.remove_partial_rows(filepath.name)
+        stats = ParseStats()
+        inserted = 0
+        started = time.monotonic()
         try:
-            packets = parser.parse(filepath)
+            for chunk in parser.parse_chunks(filepath, stats, INSERT_BATCH_SIZE):
+                new_sources = lifecycle.unknown_sources({p.src_ip for p in chunk})
+                lifecycle.save_sources(enricher.enrich_sources(new_sources))
+                inserted += lifecycle.save_batch(chunk, filepath.name)
         except PcapParseError as e:
+            lifecycle.remove_partial_rows(filepath.name)    # chunks of the unreadable file that were already stored
             lifecycle.quarantine_pcap(filepath, str(e), sha256)
             return
 
-        if not packets:
-            logger.info(f"No IP packets in {filepath.name}, archiving.")
-            lifecycle.log_file(filepath, sha256, "empty")
+        if not inserted:
+            logger.info(f"No packets for the darknet in {filepath.name} ({stats.frames} frames), archiving.")
+            lifecycle.log_file(filepath, sha256, "empty", stats)
             lifecycle.archive_pcap(filepath)
             return
 
-        enriched = enricher.enrich_batch(packets)
-        lifecycle.remove_partial_rows(filepath.name)
-        lifecycle.save_batch(enriched, filepath.name)
-        lifecycle.log_file(filepath, sha256, "ingested", packets=enriched)
+        lifecycle.log_file(filepath, sha256, "ingested", stats, inserted)
+        lifecycle.check_ingestion_speed(inserted, time.monotonic() - started)
         lifecycle.archive_pcap(filepath)
-        logger.info(f"Done: {filepath.name} - {len(enriched)} packets ingested.")
+        logger.info(
+            f"Done: {filepath.name} - {inserted} packets ingested "
+            f"({stats.frames} frames, {stats.non_ip} not IPv4, {stats.non_tcp} not TCP, "
+            f"{stats.out_of_scope} outside the darknet, {stats.malformed} malformed)."
+        )
     except Exception as e:
         logger.exception(f"Failed to process {filepath.name}: {e}")
 
@@ -120,7 +131,7 @@ def main() -> None:
     logger.info(f"Prometheus metrics available on :{metrics_port}/metrics")
 
     db = get_client()
-    parser = PcapParser()
+    parser = PcapParser(Darknet(os.environ.get("DARKNET_NETS", "")))
     enricher = MetadataEnricher()
     lifecycle = DataLifecycleManager(db)
     health_mgr = HealthMonitoringManager(db)

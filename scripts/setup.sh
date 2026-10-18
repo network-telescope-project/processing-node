@@ -39,7 +39,7 @@ if [[ ! "${OS}" =~ ^(ubuntu|debian)$ ]]; then
 fi
 
 # --Dependencies--------------------------------------------------------------
-SYSTEM_DEPS=("python3" "python3-venv" "python3-pip" "libpcap-dev" "curl" "git" "rsync" "openssh-server" "ufw" "jq" "gettext-base")
+SYSTEM_DEPS=("python3" "python3-venv" "python3-pip" "curl" "git" "rsync" "openssh-server" "ufw" "jq" "gettext-base")
 MISSING_DEPS=()
 
 log "Auditing PROCESSING node dependencies..."

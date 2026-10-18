@@ -1,4 +1,4 @@
-scapy==2.5.0
+dpkt==1.9.8
 clickhouse-connect==0.7.16
 requests==2.32.3
 maxminddb==2.6.0

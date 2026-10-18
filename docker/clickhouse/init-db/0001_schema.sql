@@ -2,30 +2,43 @@
 CREATE DATABASE IF NOT EXISTS telescope;
 
 -- Main Table (packet data)
--- TODO remake the table - what we want to save matters
 CREATE TABLE IF NOT EXISTS telescope.packets (
-    ts DateTime64(3, 'UTC'),
-    ip_version UInt8,
-    src_ip LowCardinality(String),
-    dst_ip LowCardinality(String),
-    src_port Nullable(Int32),
-    dst_port Nullable(Int32),
-    protocol LowCardinality(String),
-    ttl UInt8,
-    length UInt32,
-    flags LowCardinality(String),
-    tcp_window UInt16,
-    src_asn String,
-    src_asn_name String,
-    src_country_code LowCardinality(String),
-    src_country_name LowCardinality(String),
-    src_city String,
-    pcap_file LowCardinality(String),
+    ts           DateTime64(6, 'UTC') CODEC(DoubleDelta, ZSTD(3)),
+    src_ip       IPv4,
+    dst_ip       IPv4,
+    src_port     UInt16,
+    dst_port     UInt16,
+    ttl          UInt8,
+    ip_len       UInt16,
+    ip_id        UInt16,
+    ip_df        UInt8,
+    flags        UInt8,
+    tcp_window   UInt16,
+    tcp_seq      UInt32,
+    tcp_ack      UInt32,
+    tcp_options  LowCardinality(String),
+    tcp_mss      UInt16,
+    tcp_wscale   UInt8,
+    payload_len  UInt16,
+    pcap_file    LowCardinality(String),
     INDEX idx_pcap_file pcap_file TYPE bloom_filter GRANULARITY 4
 ) ENGINE = MergeTree()
 PARTITION BY toYYYYMMDD(ts)
-ORDER BY (ts, dst_port)
-SETTINGS allow_nullable_key = 1;    -- TODO deal with the nullable bullshit later
+ORDER BY (toStartOfHour(ts), src_ip, ts);
+
+
+-- Enrichment of the source addresses (GeoIP / ASN), one row per source.
+CREATE TABLE IF NOT EXISTS telescope.source_enrichment
+(
+    ip            IPv4,
+    asn           UInt32,
+    asn_name      LowCardinality(String),
+    country_code  LowCardinality(String),
+    country_name  LowCardinality(String),
+    city          String
+)
+ENGINE = MergeTree
+ORDER BY ip;
 
 
 -- One row per handled PCAP file (ingested, empty or quarantined)
@@ -40,10 +53,11 @@ CREATE TABLE IF NOT EXISTS telescope.pcap_ingest_log
     frames       UInt32,
     parsed       UInt32,
     non_ip       UInt32,
+    non_tcp      UInt32,
+    out_of_scope UInt32,
     malformed    UInt32,
     duplicates   UInt32,
     inserted     UInt32,
-    geoip_build  String,
     tool_version String,
     status       LowCardinality(String),
     message      String DEFAULT ''
@@ -73,42 +87,3 @@ PARTITION BY toYYYYMM(ts)
 ORDER BY ts
 TTL toDateTime(ts) + INTERVAL 365 DAY
 SETTINGS index_granularity = 8192;
-
-
--- Aggregated View for Dashboards
--- TODO more aggregated views - get inspiration from papers
-CREATE MATERIALIZED VIEW IF NOT EXISTS telescope.mv_hourly_country_pkt_count
-ENGINE = SummingMergeTree()
-PARTITION BY toYYYYMM(hour)
-ORDER BY (hour, src_country_code)
-AS SELECT
-    toStartOfHour(ts) AS hour,
-    src_country_code,
-    count() AS packet_count,
-    uniq(src_ip) AS unique_src_ips
-FROM telescope.packets
-GROUP BY hour, src_country_code;
-
-CREATE MATERIALIZED VIEW IF NOT EXISTS telescope.mv_hourly_protocol_pkt_count
-ENGINE = SummingMergeTree()
-PARTITION BY toYYYYMM(hour)
-ORDER BY (hour, protocol)
-AS SELECT
-    toStartOfHour(ts) AS hour,
-    protocol,
-    count() AS packet_count
-FROM telescope.packets
-GROUP BY hour, protocol;
-
-CREATE MATERIALIZED VIEW IF NOT EXISTS telescope.mv_hourly_dst_port_count
-ENGINE = SummingMergeTree()
-PARTITION BY toYYYYMM(hour)
-ORDER BY (hour, dst_port)
-SETTINGS allow_nullable_key = 1    -- TODO deal with the nullable bullshit later
-AS SELECT
-    toStartOfHour(ts) AS hour,
-    dst_port,
-    count() AS packet_count
-FROM telescope.packets
-WHERE dst_port IS NOT NULL
-GROUP BY hour, dst_port;
