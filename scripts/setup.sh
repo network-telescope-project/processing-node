@@ -109,10 +109,13 @@ mkdir -p \
     "${DOCKER_DIR}/clickhouse/clickhouse_data" \
     "${DOCKER_DIR}/clickhouse/clickhouse_logs" \
     "${DOCKER_DIR}/grafana/grafana_data" \
-    "${DOCKER_DIR}/geoip"
+    "${DOCKER_DIR}/geoip" \
+    "${DOCKER_DIR}/prometheus/targets"
 chown -R 101:101 \
     "${DOCKER_DIR}/clickhouse/clickhouse_data" \
     "${DOCKER_DIR}/clickhouse/clickhouse_logs" 2>/dev/null || true
+# The processing pipeline writes the capturing nodes' scrape targets here, Prometheus reads them
+chown "${NT_USER}:${NT_GROUP}" "${DOCKER_DIR}/prometheus/targets"
 ok "Docker bind-mount directories created."
 
 # --Environment file---------------------------------------------------------
@@ -138,13 +141,12 @@ else
 fi
 
 # --prometheus.yml from template---------------------------------------------
-# TODO remake this to generate prometheus.yml with correct Capturing Node internal IPs
 PROM_TEMPLATE="${DOCKER_DIR}/prometheus/prometheus.yml.template"
 PROM_OUT="${DOCKER_DIR}/prometheus/prometheus.yml"
 if [[ -f "${ENV_FILE}" ]]; then
     set -a; source "${ENV_FILE}"; set +a
     envsubst < "${PROM_TEMPLATE}" > "${PROM_OUT}"
-    ok "Generated prometheus.yml (capturing node: ${CAPTURING_NODE_IP:-localhost}:${CAPTURING_NODE_EXPORTER_PORT:-9100})"
+    ok "Generated prometheus.yml"
 else
     warn "No .env yet - run setup.sh again after creating .env to generate prometheus.yml"
 fi
@@ -194,6 +196,7 @@ Group=${NT_GROUP}
 WorkingDirectory=${PROJECT_ROOT}
 EnvironmentFile=${ENV_FILE}
 Environment=GEOIP_DB_DIR=${DOCKER_DIR}/geoip
+Environment=PROMETHEUS_TARGETS_FILE=${DOCKER_DIR}/prometheus/targets/capturing-nodes.json
 ExecStart=${VENV_DIR}/bin/python -m src.main
 Restart=always
 RestartSec=10
@@ -215,3 +218,6 @@ echo -e "\033[1;33mNext steps:\033[0m"
 echo -e "\033[1;33m   1. Edit ${ENV_FILE}\033[0m"
 echo -e "\033[1;33m   2. Add the capturing node's SSH public key to ${AUTHORIZED_KEYS}"
 echo -e "\033[1;33m   3. Run: sudo ./scripts/start.sh\033[0m"
+echo -e "\033[1;33m   4. Register each capturing node (it delivers its files to ${DATA_DIR}/<sensor_id>/, i.e. REMOTE_DIR on that node):\033[0m"
+echo -e "\033[1;33m      ${VENV_DIR}/bin/python -m src.registry add-sensor <sensor_id> --exporter <node_ip>:9100\033[0m"
+echo -e "\033[1;33m      ${VENV_DIR}/bin/python -m src.registry add-prefix <sensor_id> <its DARKNET_NETS prefixes>\033[0m"

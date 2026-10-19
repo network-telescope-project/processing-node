@@ -11,10 +11,12 @@ scrape_configs:
     static_configs:
       - targets: ['localhost:9090']
 
-  # Capturing Node (prometheus-node-exporter)
+  # Capturing nodes (prometheus-node-exporter). The targets, labelled sensor=<id>, are written by the processing
+  # node from the sensor registry (python -m src.registry add-sensor ... --exporter host:port)
   - job_name: capturing-node
-    static_configs:
-      - targets: ['${CAPTURING_NODE_IP}:${CAPTURING_NODE_EXPORTER_PORT}']
+    file_sd_configs:
+      - files: ['/etc/prometheus/targets/capturing-nodes.json']
+        refresh_interval: 1m
     relabel_configs:
       - target_label: node
         replacement: capturing

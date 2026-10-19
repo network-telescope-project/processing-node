@@ -196,13 +196,9 @@ def _open_reader(fh):
 class PcapParser:
     """Streams a .pcap / .pcapng file into rows for telescope.packets: IPv4 TCP packets to the darknet."""
 
-    def __init__(self, darknet: Darknet | None = None):
-        self._darknet = darknet or Darknet()
-        if not self._darknet:
-            logger.warning("DARKNET_NETS is empty - not filtering on the destination (local mode only)")
-
-    def parse_chunks(self, filepath: Path, stats: ParseStats, chunk_size: int) -> Iterator[list[Packet]]:
-        """Yield lists of at most chunk_size rows. Raises PcapParseError if the file cannot be read to its end."""
+    def parse_chunks(self, filepath: Path, stats: ParseStats, chunk_size: int, darknet: Darknet) -> Iterator[list[Packet]]:
+        """Yield lists of at most chunk_size rows, of the packets addressed to the darknet (an empty one keeps all).
+        Raises PcapParseError if the file cannot be read to its end."""
         chunk: list[Packet] = []
         try:
             with filepath.open("rb") as fh:
@@ -210,15 +206,18 @@ class PcapParser:
                 dlt = reader.datalink()
                 if dlt not in SUPPORTED_DLTS:
                     raise PcapParseError(f"{filepath.name}: unsupported link type {dlt}")
-                for ts, buf in reader:
-                    stats.frames += 1
-                    packet = self._parse_frame(ts, buf, dlt, stats)
-                    if packet is None:
-                        continue
-                    chunk.append(packet)
-                    if len(chunk) >= chunk_size:
-                        yield chunk
-                        chunk = []
+                try:
+                    for ts, buf in reader:
+                        stats.frames += 1
+                        packet = self._parse_frame(ts, buf, dlt, stats, darknet)
+                        if packet is None:
+                            continue
+                        chunk.append(packet)
+                        if len(chunk) >= chunk_size:
+                            yield chunk
+                            chunk = []
+                except dpkt.NeedData:
+                    stats.malformed += 1    # the file ends inside a record header (like a cut-off last frame)
         except PcapParseError:
             raise
         except Exception as e:
@@ -228,7 +227,7 @@ class PcapParser:
         if chunk:
             yield chunk
 
-    def _parse_frame(self, ts: float, buf: bytes, dlt: int, stats: ParseStats) -> Packet | None:
+    def _parse_frame(self, ts: float, buf: bytes, dlt: int, stats: ParseStats, darknet: Darknet) -> Packet | None:
         try:
             l3 = _network_layer(buf, dlt)
             if l3 is None or isinstance(l3, dpkt.ip6.IP6):
@@ -245,7 +244,7 @@ class PcapParser:
                 raise dpkt.UnpackError("truncated TCP header")
 
             dst_ip = int.from_bytes(l3.dst, "big")
-            if self._darknet and dst_ip not in self._darknet:
+            if darknet and dst_ip not in darknet:
                 stats.out_of_scope += 1
                 return None
 

@@ -17,6 +17,7 @@ GB = 1024 ** 3
 
 HEALTH_COLUMNS = [
     "ts",
+    "sensor_id",
     "ingestion_pps",
     "rx_dropped_rate",
     "rx_missed_rate",
@@ -79,12 +80,13 @@ def find_filesystem(path: str, avail: list[tuple[dict, float]], size: list[tuple
 
 
 class HealthMonitoringManager:
-    def __init__(self, db_client):
+    def __init__(self, db_client, registry):
         self._db = db_client
+        self._registry = registry
         self._prometheus_url = os.environ.get("PROMETHEUS_URL", "http://localhost:9090")
         self._alert_webhook = os.environ.get("ALERT_WEBHOOK_URL", "")
-        self._disk_state = "ok"  # ok | low | unknown
-        self._disk_last_alert = 0.0
+        self._disk_state: dict[str, str] = {}  # per sensor: ok | low | unknown
+        self._disk_last_alert: dict[str, float] = {}
 
     def _q(self, metric: str) -> float:
         result = _query_prometheus(self._prometheus_url, metric)
@@ -92,41 +94,43 @@ class HealthMonitoringManager:
             return 0.0
         return result
 
-    def _collect_metrics(self) -> dict[str, Any]:
+    def _collect_metrics(self, sensor: str) -> dict[str, Any]:
         m: dict[str, Any] = {}
+        # The sensor label is put on the capturing node's exporter target by Prometheus (see the sensor registry)
+        node = f'job="capturing-node",sensor="{sensor}"'
 
         # Reflects actual packets reaching the DB, not just arriving at the NIC
-        m["ingestion_pps"] = self._q("rate(telescope_packets_ingested_total[5m])")
+        m["ingestion_pps"] = self._q(f'sum(rate(telescope_packets_ingested_total{{sensor="{sensor}"}}[5m]))')
 
         # NIC health
-        m["rx_dropped_rate"] = self._q("rate(node_ethtool_rx_dropped_total[5m])")
-        m["rx_missed_rate"] = self._q("rate(node_ethtool_rx_missed_errors_total[5m])")
-        m["rx_fifo_rate"] = self._q("rate(node_ethtool_rx_fifo_errors_total[5m])")
-        m["udp_rx_errors"] = self._q("node_netstat_Udp_RxErrors")
+        m["rx_dropped_rate"] = self._q(f"rate(node_ethtool_rx_dropped_total{{{node}}}[5m])")
+        m["rx_missed_rate"] = self._q(f"rate(node_ethtool_rx_missed_errors_total{{{node}}}[5m])")
+        m["rx_fifo_rate"] = self._q(f"rate(node_ethtool_rx_fifo_errors_total{{{node}}}[5m])")
+        m["udp_rx_errors"] = self._q(f"node_netstat_Udp_RxErrors{{{node}}}")
 
         # TODO make these queries adaptive rather than hardcoded
         # Disk health
         capture_path = os.environ.get("CAPTURE_MOUNTPOINT", "/var/lib/network-telescope")
         fs = find_filesystem(
             capture_path,
-            _query_prometheus_series(self._prometheus_url, 'node_filesystem_avail_bytes{job="capturing-node"}'),
-            _query_prometheus_series(self._prometheus_url, 'node_filesystem_size_bytes{job="capturing-node"}'),
+            _query_prometheus_series(self._prometheus_url, f"node_filesystem_avail_bytes{{{node}}}"),
+            _query_prometheus_series(self._prometheus_url, f"node_filesystem_size_bytes{{{node}}}"),
         )
         m["capture_path"] = capture_path
         m["capture_fs"] = fs
         m["disk_avail_bytes"] = fs[1] if fs else 0.0
-        m["disk_io_util"] = self._q("rate(node_disk_io_time_seconds_total[5m])")
+        m["disk_io_util"] = self._q(f"rate(node_disk_io_time_seconds_total{{{node}}}[5m])")
 
         # Process health
-        m["dumpcap_cpu_pct"] = self._q('rate(namedprocess_namegroup_cpu_seconds_total{groupname="dumpcap"}[5m]) * 100')
-        m["nic_temp_celsius"] = self._q("node_hwmon_temp_celsius")
+        m["dumpcap_cpu_pct"] = self._q(f'rate(namedprocess_namegroup_cpu_seconds_total{{{node},groupname="dumpcap"}}[5m]) * 100')
+        m["nic_temp_celsius"] = self._q(f"node_hwmon_temp_celsius{{{node}}}")
 
         return m
 
-    def _check_nic_drop(self, rx_dropped_rate: float) -> bool:
+    def _check_nic_drop(self, sensor: str, rx_dropped_rate: float) -> bool:
         if rx_dropped_rate > NIC_DROP_THRESHOLD:
             msg = (
-                f"[Network Telescope] NIC DROP ALERT: "
+                f"[Network Telescope] {sensor}: NIC DROP ALERT: "
                 f"rx_dropped_rate={rx_dropped_rate:.2f} pkt/s "
                 f"(threshold={NIC_DROP_THRESHOLD:.1f})"
             )
@@ -143,45 +147,56 @@ class HealthMonitoringManager:
         except Exception as e:
             logger.warning(f"Alert webhook failed: {e}")
 
-    def _check_disk(self, capture_path: str, fs) -> None:
+    def _check_disk(self, sensor: str, capture_path: str, fs) -> None:
         """Alert when the capture node's disk runs low."""
         now = time.time()
+        previous = self._disk_state.get(sensor, "ok")
         if fs is None:
             state, msg = "unknown", (
-                f"[Network Telescope] CAPTURE DISK UNKNOWN: no filesystem metrics for {capture_path} "
+                f"[Network Telescope] {sensor}: CAPTURE DISK UNKNOWN: no filesystem metrics for {capture_path} "
                 "from the capturing node (is its node-exporter reachable?)"
             )
         else:
             mount, avail, size = fs
             pct = avail / size * 100
             if pct >= DISK_LOW_THRESHOLD_PCT:
-                if self._disk_state != "ok":
-                    msg = f"[Network Telescope] Capture disk OK again: {pct:.1f}% free ({avail / GB:.1f} GB of {size / GB:.1f} GB on {mount})"
+                if previous != "ok":
+                    msg = f"[Network Telescope] {sensor}: capture disk OK again: {pct:.1f}% free ({avail / GB:.1f} GB of {size / GB:.1f} GB on {mount})"
                     logger.info(msg)
                     self._send_alert(msg)
-                self._disk_state = "ok"
+                self._disk_state[sensor] = "ok"
                 return
             state, msg = "low", (
-                f"[Network Telescope] CAPTURE DISK LOW: {pct:.1f}% free ({avail / GB:.1f} GB of {size / GB:.1f} GB "
+                f"[Network Telescope] {sensor}: CAPTURE DISK LOW: {pct:.1f}% free ({avail / GB:.1f} GB of {size / GB:.1f} GB "
                 f"on {mount}), threshold {DISK_LOW_THRESHOLD_PCT:.0f}%. Check the PCAP transfer to the processing node."
             )
 
-        if state != self._disk_state or now - self._disk_last_alert > DISK_ALERT_REPEAT_SECONDS:
+        if state != previous or now - self._disk_last_alert.get(sensor, 0.0) > DISK_ALERT_REPEAT_SECONDS:
             logger.warning(msg)
             self._send_alert(msg)
-            self._disk_last_alert = now
-        self._disk_state = state
+            self._disk_last_alert[sensor] = now
+        self._disk_state[sensor] = state
 
     def run(self) -> None:
-        ts = datetime.now(tz=timezone.utc)
         logger.info("Running health check...")
+        try:
+            sensors = self._registry.monitored_ids()
+        except Exception as e:
+            logger.error(f"Could not read the sensor registry, health check skipped: {e}")
+            return
+        for sensor in sensors:
+            self._run_sensor(sensor)
 
-        metrics = self._collect_metrics()
-        pps_drop_alert = self._check_nic_drop(metrics["rx_dropped_rate"])
-        self._check_disk(metrics["capture_path"], metrics["capture_fs"])
+    def _run_sensor(self, sensor: str) -> None:
+        ts = datetime.now(tz=timezone.utc)
+
+        metrics = self._collect_metrics(sensor)
+        pps_drop_alert = self._check_nic_drop(sensor, metrics["rx_dropped_rate"])
+        self._check_disk(sensor, metrics["capture_path"], metrics["capture_fs"])
 
         row = [[
             ts,
+            sensor,
             metrics["ingestion_pps"],
             metrics["rx_dropped_rate"],
             metrics["rx_missed_rate"],
@@ -196,6 +211,6 @@ class HealthMonitoringManager:
 
         try:
             self._db.insert("telescope_health", row, column_names=HEALTH_COLUMNS)
-            logger.info(f"Health snapshot saved. ingestion_pps={metrics['ingestion_pps']:.1f}, rx_dropped={metrics['rx_dropped_rate']:.2f}/s")
+            logger.info(f"Health snapshot saved for {sensor}. ingestion_pps={metrics['ingestion_pps']:.1f}, rx_dropped={metrics['rx_dropped_rate']:.2f}/s")
         except Exception as e:
             logger.error(f"Failed to write health snapshot: {e}")

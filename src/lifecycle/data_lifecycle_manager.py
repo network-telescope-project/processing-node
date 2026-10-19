@@ -20,6 +20,11 @@ logger = logging.getLogger(__name__)
 PACKETS_INGESTED = Counter(
     "telescope_packets_ingested_total",
     "Total number of packet records inserted into ClickHouse",
+    ["sensor"],
+)
+HELD_FILES = Gauge(
+    "telescope_held_files",
+    "PCAP files left in the inbox because their sensor is not registered, deactivated or has no address space",
 )
 PCAPS_ARCHIVED = Counter(
     "telescope_pcap_archived_total",
@@ -50,10 +55,11 @@ ARCHIVE_ERRORS = Counter(
     ["stage"],  # move | compress | quarantine
 )
 
-COLUMNS = [*Packet._fields, "pcap_file"]
+COLUMNS = [*Packet._fields, "sensor_id", "pcap_file"]
 COLUMN_TYPES = [
     "DateTime64(6, 'UTC')", "UInt32", "UInt32", "UInt16", "UInt16", "UInt8", "UInt16", "UInt16", "UInt8", "UInt8",
-    "UInt16", "UInt32", "UInt32", "LowCardinality(String)", "UInt16", "UInt8", "UInt16", "LowCardinality(String)",
+    "UInt16", "UInt32", "UInt32", "LowCardinality(String)", "UInt16", "UInt8", "UInt16",
+    "LowCardinality(String)", "LowCardinality(String)",
 ]
 
 SOURCE_COLUMNS = ["ip", "asn", "asn_name", "country_code", "country_name", "city"]
@@ -62,7 +68,7 @@ SOURCE_COLUMN_TYPES = [
 ]
 
 LOG_COLUMNS = [
-    "ingested_at", "file_name", "file_sha256", "file_size", "ts_min", "ts_max", "frames", "parsed",
+    "ingested_at", "sensor_id", "file_name", "file_sha256", "file_size", "ts_min", "ts_max", "frames", "parsed",
     "non_ip", "non_tcp", "out_of_scope", "malformed", "duplicates", "inserted", "tool_version", "status", "message",
 ]
 TOOL_VERSION = f"nt-processing/{PARSER_VERSION}"
@@ -106,6 +112,7 @@ class DataLifecycleManager:
     def __init__(self, db_client):
         self._db = db_client
         self._last_ingestion_pps: float | None = None
+        self._held_reported: set[tuple[str, str]] = set()
         self._alert_webhook = os.environ.get("ALERT_WEBHOOK_URL", "")
         self._archive_dir = PCAP_ARCHIVE_DIR
         self._quarantine_dir = PCAP_QUARANTINE_DIR
@@ -118,23 +125,34 @@ class DataLifecycleManager:
         )
         return res.result_rows[0][0] > 0
 
-    def remove_partial_rows(self, pcap_file: str) -> None:
+    def remove_partial_rows(self, sensor_id: str, pcap_file: str) -> None:
         """Delete rows left by mid-insert crashed attempt, so retrying the file doesn't duplicate them."""
         res = self._db.query(
-            "SELECT count() FROM packets WHERE pcap_file = {f:String}", parameters={"f": pcap_file}
+            "SELECT count() FROM packets WHERE sensor_id = {s:String} AND pcap_file = {f:String}",
+            parameters={"s": sensor_id, "f": pcap_file},
         )
         n = res.result_rows[0][0]
         if n:
-            logger.warning(f"{pcap_file}: removing {n} rows of an unfinished earlier attempt before re-ingesting")
+            logger.warning(f"{sensor_id}/{pcap_file}: removing {n} rows of an unfinished earlier attempt before re-ingesting")
             self._db.command(
-                "ALTER TABLE packets DELETE WHERE pcap_file = {f:String}",
-                parameters={"f": pcap_file},
+                "ALTER TABLE packets DELETE WHERE sensor_id = {s:String} AND pcap_file = {f:String}",
+                parameters={"s": sensor_id, "f": pcap_file},
                 settings={"mutations_sync": 1},
             )
+
+    def report_held(self, sensor_id: str, reason: str) -> None:
+        """A file stays in the inbox because its sensor cannot be ingested; said once per reason, not every scan"""
+        if (sensor_id, reason) in self._held_reported:
+            return
+        self._held_reported.add((sensor_id, reason))
+        msg = f"[Network Telescope] FILES HELD in the inbox: {reason}. Register it with `python -m src.registry`; they are ingested once it is ready."
+        logger.warning(msg)
+        self._send_alert(msg)
 
     def log_file(
         self,
         filepath: Path,
+        sensor_id: str,
         sha256: str,
         status: str,
         stats: ParseStats | None = None,
@@ -143,23 +161,23 @@ class DataLifecycleManager:
     ) -> None:
         s = stats or ParseStats()
         row = [
-            datetime.now(tz=timezone.utc), filepath.name, sha256, filepath.stat().st_size,
+            datetime.now(tz=timezone.utc), sensor_id, filepath.name, sha256, filepath.stat().st_size,
             s.ts_min, s.ts_max, s.frames, s.parsed, s.non_ip, s.non_tcp, s.out_of_scope, s.malformed, 0, inserted,
             TOOL_VERSION, status, message,
         ]
         self._db.insert("pcap_ingest_log", [row], column_names=LOG_COLUMNS)
 
-    def save_batch(self, packets: list[Packet], pcap_file: str) -> int:
+    def save_batch(self, packets: list[Packet], sensor_id: str, pcap_file: str) -> int:
         """Insert one chunk of parsed packets."""
         if not packets:
             return 0
-        rows = [(*p, pcap_file) for p in packets]
+        rows = [(*p, sensor_id, pcap_file) for p in packets]
         try:
             self._db.insert("packets", rows, column_names=COLUMNS, column_type_names=COLUMN_TYPES)
         except Exception as e:
             logger.error(f"ClickHouse insert failed: {e}")
             raise
-        PACKETS_INGESTED.inc(len(rows))
+        PACKETS_INGESTED.labels(sensor=sensor_id).inc(len(rows))
         logger.debug(f"Inserted {len(rows)} rows into ClickHouse.")
         return len(rows)
 
@@ -223,10 +241,12 @@ class DataLifecycleManager:
                 )
         self.update_quarantine_gauge()
 
-    def archive_pcap(self, filepath: Path) -> None:
-        """Take an ingested file out of the inbox into the archive, compress it, apply retention."""
+    def archive_pcap(self, filepath: Path, sensor_id: str) -> None:
+        """Take an ingested file out of the inbox into the archive (a sub-directory per sensor), compress it, apply retention."""
         try:
-            _move(filepath, self._archive_dir / filepath.name)
+            dest_dir = self._archive_dir / sensor_id
+            dest_dir.mkdir(exist_ok=True)
+            _move(filepath, dest_dir / filepath.name)
         except OSError as e:
             ARCHIVE_ERRORS.labels(stage="move").inc()
             logger.error(f"Could not archive {filepath.name}: {e}")
@@ -236,10 +256,11 @@ class DataLifecycleManager:
         logger.info(f"Archived: {filepath.name}")
         self.maintain_archive()
 
-    def quarantine_pcap(self, filepath: Path, reason: str, sha256: str = "") -> None:
-        """Keep a file that could not be parsed, untouched, for later inspection."""
-        dest = self._quarantine_dir / filepath.name
+    def quarantine_pcap(self, filepath: Path, sensor_id: str, reason: str, sha256: str = "") -> None:
+        """Keep a file that could not be parsed, untouched, for later inspection (a sub-directory per sensor)."""
+        dest = self._quarantine_dir / sensor_id / filepath.name
         try:
+            dest.parent.mkdir(exist_ok=True)
             _move(filepath, dest)
             dest.with_name(dest.name + ".error.txt").write_text(
                 f"{datetime.now(tz=timezone.utc).isoformat()}\n{reason}\n"
@@ -250,26 +271,26 @@ class DataLifecycleManager:
             return
 
         try:
-            self.log_file(dest, sha256, "quarantined", message=reason)
+            self.log_file(dest, sensor_id, sha256, "quarantined", message=reason)
         except Exception as e:
             logger.warning(f"Could not write the ingest log row for {dest.name}: {e}")
 
         PCAPS_QUARANTINED.inc()
         self.update_quarantine_gauge()
-        msg = f"[Network Telescope] PCAP QUARANTINED: {filepath.name} - {reason}"
+        msg = f"[Network Telescope] PCAP QUARANTINED: {sensor_id}/{filepath.name} - {reason}"
         logger.error(msg)
         self._send_alert(msg)
 
     def update_quarantine_gauge(self) -> None:
-        files = list(self._quarantine_dir.glob("*.pcap"))
+        files = list(self._quarantine_dir.glob("*/*.pcap"))
         QUARANTINE_FILES.set(len(files))
         QUARANTINE_BYTES.set(sum(f.stat().st_size for f in files))
 
     def maintain_archive(self) -> None:
         """Compress leftovers, then enforce retention (age, size cap, minimum free disk)."""
-        for tmp in self._archive_dir.glob("*.tmp"):
+        for tmp in self._archive_dir.glob("*/*.tmp"):
             tmp.unlink(missing_ok=True)
-        for raw in sorted(self._archive_dir.glob("*.pcap")):
+        for raw in sorted(self._archive_dir.glob("*/*.pcap")):
             self._compress(raw)
         self.prune_archive()
 
@@ -293,7 +314,7 @@ class DataLifecycleManager:
         """Delete the oldest archive files while any limit is exceeded."""
         entries = sorted(
             (st.st_mtime, st.st_size, p)
-            for p in self._archive_dir.iterdir()
+            for p in self._archive_dir.glob("*/*")
             if p.is_file() and p.suffix in (".zst", ".pcap")
             for st in (p.stat(),)
         )
