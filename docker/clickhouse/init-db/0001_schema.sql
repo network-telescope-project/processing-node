@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS telescope.packets (
     tcp_mss      UInt16,
     tcp_wscale   UInt8,
     payload_len  UInt16,
-    pcap_file    LowCardinality(String),
+    sensor_id    LowCardinality(String),   -- capture node the packet came from (mgmt.sensors)
+    pcap_file    LowCardinality(String),   -- file name, unique only together with sensor_id
     INDEX idx_pcap_file pcap_file TYPE bloom_filter GRANULARITY 4
 ) ENGINE = MergeTree()
 PARTITION BY toYYYYMMDD(ts)
@@ -45,6 +46,7 @@ ORDER BY ip;
 CREATE TABLE IF NOT EXISTS telescope.pcap_ingest_log
 (
     ingested_at  DateTime64(3, 'UTC'),
+    sensor_id    LowCardinality(String),
     file_name    String,
     file_sha256  String,
     file_size    UInt64,
@@ -71,6 +73,7 @@ ORDER BY (file_sha256, ingested_at);
 CREATE TABLE IF NOT EXISTS telescope.telescope_health
 (
     ts DateTime('UTC'),
+    sensor_id LowCardinality(String),   -- capture node ID
     ingestion_pps Float64,    -- packets per second reaching DB
     rx_dropped_rate Float64,    -- NIC rx_dropped per second
     rx_missed_rate Float64, -- NIC rx_missed_errors per second
@@ -84,6 +87,6 @@ CREATE TABLE IF NOT EXISTS telescope.telescope_health
 )
 ENGINE = MergeTree()
 PARTITION BY toYYYYMM(ts)
-ORDER BY ts
+ORDER BY (sensor_id, ts)
 TTL toDateTime(ts) + INTERVAL 365 DAY
 SETTINGS index_granularity = 8192;

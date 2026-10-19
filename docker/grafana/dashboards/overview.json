@@ -162,19 +162,19 @@
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "prometheus-telescope" },
           "expr": "rate(node_ethtool_rx_dropped_total[5m])",
-          "legendFormat": "rx_dropped/s"
+          "legendFormat": "{{sensor}} rx_dropped/s"
         },
         {
           "refId": "B",
           "datasource": { "type": "prometheus", "uid": "prometheus-telescope" },
           "expr": "rate(node_ethtool_rx_missed_errors_total[5m])",
-          "legendFormat": "rx_missed/s"
+          "legendFormat": "{{sensor}} rx_missed/s"
         },
         {
           "refId": "C",
           "datasource": { "type": "prometheus", "uid": "prometheus-telescope" },
           "expr": "rate(node_ethtool_rx_fifo_errors_total[5m])",
-          "legendFormat": "rx_fifo/s"
+          "legendFormat": "{{sensor}} rx_fifo/s"
         }
       ]
     },
@@ -190,7 +190,7 @@
         "refID": "A",
         "datasource": {"type": "prometheus", "uid": "prometheus-telescope"},
         "expr": "node_filesystem_avail_bytes{job='capturing-node'}",
-        "legendFormat": "Available bytes"
+        "legendFormat": "{{sensor}} available bytes"
       }]
     }
 
