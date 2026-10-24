@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS mgmt.sensor_prefixes
     prefix       String,        -- IPv4 network in CIDR notation, a single address as /32
     valid_from   DateTime('UTC'),
     valid_to     Nullable(DateTime('UTC')),   -- NULL = still monitored
-    version      UInt64 DEFAULT toUnixTimestamp64Micro(now64(6))
+    version      UInt64 DEFAULT toUnixTimestamp64Micro(now64(6)),
+    mode         LowCardinality(String) DEFAULT 'passive'
 )
 ENGINE = ReplacingMergeTree(version)
 ORDER BY (sensor_id, prefix, valid_from);

@@ -10,9 +10,8 @@ from pathlib import Path
 
 from src.parser.pcap_parser import Darknet
 
-# Files that are not in a sensor's sub-directory of the inbox (the single-node local Docker setup) belong to this
-# sensor; it is not in the registry, its address space comes from DARKNET_NETS
-LOCAL_SENSOR_ID = "local"
+LOCAL_SENSOR_ID = "local"   # Single-node local Docker setup
+MODES = ("passive", "reactive")
 SENSOR_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 EXPORTER = re.compile(r"^[A-Za-z0-9._-]+:\d{1,5}$")
 
@@ -70,15 +69,15 @@ class SensorRegistry:
         ids = [s.sensor_id for s in self.sensors() if s.active]
         return ids or [LOCAL_SENSOR_ID]
 
-    def prefixes(self, sensor_id: str | None = None, open_only: bool = True) -> list[tuple[str, str, datetime, datetime | None]]:
-        """(sensor_id, prefix, valid_from, valid_to) rows, optionally of one sensor and only the still valid ones"""
+    def prefixes(self, sensor_id: str | None = None, open_only: bool = True) -> list[tuple[str, str, datetime, datetime | None, str]]:
+        """(sensor_id, prefix, valid_from, valid_to, mode) rows, optionally of one sensor and only the still valid ones"""
         where = ["1"]
         if open_only:
             where.append("valid_to IS NULL")
         if sensor_id:
             where.append("sensor_id = {s:String}")
         return self._db.query(
-            "SELECT sensor_id, prefix, valid_from, valid_to FROM mgmt.sensor_prefixes FINAL "
+            "SELECT sensor_id, prefix, valid_from, valid_to, mode FROM mgmt.sensor_prefixes FINAL "
             f"WHERE {' AND '.join(where)} ORDER BY sensor_id, prefix, valid_from",
             parameters={"s": sensor_id or ""},
         ).result_rows
@@ -138,19 +137,22 @@ class SensorRegistry:
         if exporter and not EXPORTER.match(exporter):
             raise RegistryError(f"exporter {exporter!r}: expected host:port")
 
-    def add_prefix(self, sensor_id: str, prefix: str) -> str:
-        """Start monitoring a prefix now; returns its normalised form. A prefix is never shared between sensors."""
+    def add_prefix(self, sensor_id: str, prefix: str, mode: str = "passive") -> str:
+        """Start monitoring a prefix now; returns its normalized form. A prefix is never shared between sensors.
+        To change the mode of a monitored prefix, remove it and add it again."""
+        if mode not in MODES:
+            raise RegistryError(f"mode {mode!r}: expected one of {', '.join(MODES)}")
         net = ipaddress.ip_network(normalize_prefix(prefix))
         if self.get_sensor(sensor_id) is None:
             raise RegistryError(f"unknown sensor '{sensor_id}'")
-        for owner, other, _, _ in self.prefixes():
+        for owner, other, _, _, _ in self.prefixes():
             if ipaddress.ip_network(other).overlaps(net):
                 if owner == sensor_id and other == str(net):
                     raise RegistryError(f"{net} is already monitored by '{sensor_id}'")
                 raise RegistryError(f"{net} overlaps {other}, monitored by '{owner}'")
         self._db.insert(
-            "sensor_prefixes", [[sensor_id, str(net), datetime.now(tz=timezone.utc), None]], database="mgmt",
-            column_names=["sensor_id", "prefix", "valid_from", "valid_to"],
+            "sensor_prefixes", [[sensor_id, str(net), datetime.now(tz=timezone.utc), None, mode]], database="mgmt",
+            column_names=["sensor_id", "prefix", "valid_from", "valid_to", "mode"],
         )
         return str(net)
 
@@ -161,8 +163,8 @@ class SensorRegistry:
         if not rows:
             raise RegistryError(f"'{sensor_id}' does not monitor {prefix}")
         self._db.insert(
-            "sensor_prefixes", [[sensor_id, prefix, rows[0][2], datetime.now(tz=timezone.utc)]], database="mgmt",
-            column_names=["sensor_id", "prefix", "valid_from", "valid_to"],
+            "sensor_prefixes", [[sensor_id, prefix, rows[0][2], datetime.now(tz=timezone.utc), rows[0][4]]], database="mgmt",
+            column_names=["sensor_id", "prefix", "valid_from", "valid_to", "mode"],
         )
         return prefix
 

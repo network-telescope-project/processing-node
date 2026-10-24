@@ -3,7 +3,7 @@
     python -m src.registry list
     python -m src.registry add-sensor SENSOR_ID [--description TEXT] [--exporter HOST:PORT]
     python -m src.registry set-sensor SENSOR_ID [--description TEXT] [--exporter HOST:PORT] [--active | --inactive]
-    python -m src.registry add-prefix SENSOR_ID CIDR [CIDR ...]
+    python -m src.registry add-prefix SENSOR_ID CIDR [CIDR ...] [--mode passive|reactive]
     python -m src.registry remove-prefix SENSOR_ID CIDR [CIDR ...]
     python -m src.registry sync-targets
 
@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=Path(__file__).parent.parent.parent / ".env")
 
 from src.db import get_client
-from src.registry.sensor_registry import RegistryError, SensorRegistry
+from src.registry.sensor_registry import MODES, RegistryError, SensorRegistry
 
 
 def _list(reg: SensorRegistry, _args) -> None:
@@ -31,9 +31,9 @@ def _list(reg: SensorRegistry, _args) -> None:
         print("No sensors registered.")
     for s in sensors:
         print(f"{s.sensor_id}  [{'active' if s.active else 'INACTIVE'}]  exporter={s.exporter or '-'}  {s.description}")
-        for _, prefix, valid_from, valid_to in reg.prefixes(s.sensor_id, open_only=False):
+        for _, prefix, valid_from, valid_to, mode in reg.prefixes(s.sensor_id, open_only=False):
             span = f"since {valid_from:%Y-%m-%d %H:%M}" if valid_to is None else f"{valid_from:%Y-%m-%d %H:%M} .. {valid_to:%Y-%m-%d %H:%M}"
-            print(f"    {prefix:<20} {span}")
+            print(f"    {prefix:<20} {mode:<9} {span}")
 
 
 def _sync(reg: SensorRegistry, _args) -> None:
@@ -66,7 +66,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = sub.add_parser("add-prefix", help="start monitoring prefixes (IPv4 CIDR, a single address is /32)")
     ap.add_argument("sensor_id")
     ap.add_argument("prefixes", nargs="+")
-    ap.set_defaults(fn=lambda r, x: [print("added", r.add_prefix(x.sensor_id, c)) for c in x.prefixes])
+    ap.add_argument("--mode", choices=MODES, default="passive", help="reactive = a responder answers on these addresses")
+    ap.set_defaults(fn=lambda r, x: [print("added", r.add_prefix(x.sensor_id, c, x.mode)) for c in x.prefixes])
 
     rp = sub.add_parser("remove-prefix", help="stop monitoring prefixes (their history stays)")
     rp.add_argument("sensor_id")
