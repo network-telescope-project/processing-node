@@ -38,6 +38,12 @@ if [[ ! "${OS}" =~ ^(ubuntu|debian)$ ]]; then
     exit 1
 fi
 
+if [[ "${PROJECT_ROOT}" == /home/* || "${PROJECT_ROOT}" == /root/* ]]; then
+    err "The repo is in ${PROJECT_ROOT}, which user '${NT_USER}' cannot read."
+    err "Clone it to /opt/network-telescope and run scripts/setup.sh from there."
+    exit 1
+fi
+
 # --Dependencies--------------------------------------------------------------
 SYSTEM_DEPS=("python3" "python3-venv" "python3-pip" "curl" "git" "rsync" "openssh-server" "ufw" "jq" "gettext-base")
 MISSING_DEPS=()
@@ -80,6 +86,18 @@ else
     ok "Docker Compose: $(docker compose version)"
 fi
 
+# --Environment file---------------------------------------------------------
+if [[ ! -f "${ENV_FILE}" ]]; then
+    cp "${PROJECT_ROOT}/.env.example" "${ENV_FILE}"
+    warn ".env created from .env.example - edit before running start.sh"
+    warn "  sudo nano ${ENV_FILE}"
+else
+    log ".env already exists."
+fi
+chown "root:${NT_GROUP}" "${ENV_FILE}"
+chmod 640 "${ENV_FILE}"
+set -a; source "${ENV_FILE}"; set +a
+
 # --User and directories-----------------------------------------------------
 log "Creating user and directories"
 if ! getent group "${NT_GROUP}" &>/dev/null; then
@@ -93,39 +111,23 @@ if ! id "${NT_USER}" &>/dev/null; then
     ok "Created user '${NT_USER}'."
 fi
 
-# Setup Docker Group
-if ! groups "$NT_USER" | grep -q "\bdocker\b"; then
-    log "Adding user to docker group..."
-    sudo usermod -aG docker "$NT_USER"
-    warn "Note: You may need to log out and back in for docker group changes to take effect."
-fi
-
 mkdir -p "${DATA_DIR}" "${ARCHIVE_DIR}" "${QUARANTINE_DIR}" "${CONF_DIR}"
 chown -R "${NT_USER}:${NT_USER}" "${DATA_DIR}" "${ARCHIVE_DIR}" "${QUARANTINE_DIR}"
 
 # Docker bind-mount dirs
 DOCKER_DIR="${PROJECT_ROOT}/docker"
+CH_DIR="${CLICKHOUSE_DATA_DIR:-${DOCKER_DIR}/clickhouse}"
 mkdir -p \
-    "${DOCKER_DIR}/clickhouse/clickhouse_data" \
-    "${DOCKER_DIR}/clickhouse/clickhouse_logs" \
+    "${CH_DIR}/clickhouse_data" \
+    "${CH_DIR}/clickhouse_logs" \
     "${DOCKER_DIR}/grafana/grafana_data" \
     "${DOCKER_DIR}/geoip" \
     "${DOCKER_DIR}/prometheus/targets"
 chown -R 101:101 \
-    "${DOCKER_DIR}/clickhouse/clickhouse_data" \
-    "${DOCKER_DIR}/clickhouse/clickhouse_logs" 2>/dev/null || true
-# The processing pipeline writes the capturing nodes' scrape targets here, Prometheus reads them
+    "${CH_DIR}/clickhouse_data" \
+    "${CH_DIR}/clickhouse_logs" 2>/dev/null || true
 chown "${NT_USER}:${NT_GROUP}" "${DOCKER_DIR}/prometheus/targets"
 ok "Docker bind-mount directories created."
-
-# --Environment file---------------------------------------------------------
-if [[ ! -f "${ENV_FILE}" ]]; then
-    cp "${PROJECT_ROOT}/.env.example" "${ENV_FILE}"
-    warn ".env created from .env.example - edit before running start.sh"
-    warn "  nano ${ENV_FILE}"
-else
-    log ".env already exists."
-fi
 
 # --Python virtual environment-----------------------------------------------
 if [ ! -d "${VENV_DIR}" ]; then
@@ -133,7 +135,6 @@ if [ ! -d "${VENV_DIR}" ]; then
     python3 -m venv "${VENV_DIR}"
     "${VENV_DIR}/bin/pip" install --quiet --upgrade pip
     "${VENV_DIR}/bin/pip" install --quiet -r "${PROJECT_ROOT}/requirements.txt"
-    chown -R "${NT_USER}:${NT_USER}" "${VENV_DIR}"
     ok "Python venv ready."
 else
     ok "Python venv exists - refreshing packages."
@@ -164,23 +165,40 @@ if [[ ! -f "${AUTHORIZED_KEYS}" ]]; then
     chmod 600 "${AUTHORIZED_KEYS}"
 fi
 
-warn "Paste the capturing node's public key into: ${AUTHORIZED_KEYS}"
-warn "Run this on the capturing node:"
-warn "ssh-copy-id -i ~/.ssh/id_ed25519.pub ${NT_USER}@<THIS_NODE_IP>"
-echo ""
+warn "Capturing nodes are added with scripts/add-sensor.sh"
 
-# --Firewall-----------------------------------------------------------------
+SSH_PORT="${SSH_INGEST_PORT:-8500}"
+listening() { [[ -n "$(ss -ltnH "sport = :$1")" ]]; }
+if listening "${SSH_PORT}"; then
+    ok "sshd already listens on port ${SSH_PORT}."
+else
+    if systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
+        # Ubuntu socket activation
+        SSH_UNIT="ssh.socket"
+        SSH_DROPIN="/etc/systemd/system/ssh.socket.d/nt-transfer-port.conf"
+        mkdir -p "$(dirname "${SSH_DROPIN}")"
+        printf '[Socket]\nListenStream=%s\n' "${SSH_PORT}" > "${SSH_DROPIN}"
+    else
+        SSH_UNIT="ssh"
+        SSH_DROPIN="/etc/ssh/sshd_config.d/nt-transfer-port.conf"
+        printf 'Port 22\nPort %s\n' "${SSH_PORT}" > "${SSH_DROPIN}"
+        sshd -t || { rm -f "${SSH_DROPIN}"; err "sshd config check failed - change reverted."; exit 1; }
+    fi
+    systemctl daemon-reload
+    systemctl restart "${SSH_UNIT}"
+    sleep 1
+    if listening 22 && listening "${SSH_PORT}"; then
+        ok "sshd listens on 22 and ${SSH_PORT}."
+    else
+        rm -f "${SSH_DROPIN}"
+        systemctl daemon-reload
+        systemctl restart "${SSH_UNIT}"
+        err "sshd does not listen on both 22 and ${SSH_PORT} - change reverted."
+        exit 1
+    fi
+fi
+
 # TODO grafana dashboard is complete shit - has to be remade
-# TODO implement firewall later
-# TODO: Configure firewall rules for production deployment:
-#   ufw allow from <CAPTURING_NODE_IP> to any port 22        # SSH from capturing node (if needed)
-#   ufw allow from 172.16.0.0/12 to any port 8000           # Prometheus scraping of processing pipeline metrics
-#                                                             # (Docker bridge subnet - needed for Prometheus container
-#                                                             #  to reach nt-processing metrics on the host)
-#   ufw allow from <YOUR_MANAGEMENT_IP> to any port 3000     # Grafana (or use SSH tunnel only)
-#   ufw allow from <YOUR_MANAGEMENT_IP> to any port 9090     # Prometheus UI (or use SSH tunnel only)
-#   ufw default deny incoming
-#   ufw enable
 
 # --Systemd service for processing-------------------------------------------
 cat > /etc/systemd/system/nt-processing.service <<EOF
@@ -212,12 +230,40 @@ systemctl daemon-reload
 systemctl enable nt-processing
 ok "Systemd unit 'nt-processing' installed and enabled."
 
+# --Firewall-----------------------------------------------------------------
+if [[ -z "${MGMT_ALLOW_FROM:-}" ]]; then
+    err "MGMT_ALLOW_FROM is not set in ${ENV_FILE} (networks allowed to ssh to port 22) - not enabling the firewall."
+    exit 1
+fi
+ufw default deny incoming > /dev/null
+ufw default allow outgoing > /dev/null
+ufw allow proto tcp from "${MGMT_ALLOW_FROM}" to any port 22 comment "nt-mgmt-ssh" > /dev/null
+# Prometheus (in a Docker bridge network) scrapes the pipeline's /metrics on the host
+ufw allow proto tcp from 172.16.0.0/12 to any port "${METRICS_PORT:-8000}" comment "nt-docker-metrics" > /dev/null
+
+if ufw status | grep -q "^Status: active"; then
+    ok "Firewall already active - rules updated."
+else
+    systemd-run --quiet --unit=nt-ufw-rollback --on-active=5min /usr/sbin/ufw disable
+    ufw --force enable > /dev/null
+    warn "Firewall enabled; it disables itself in 5 minutes unless you confirm."
+    warn "Open a NEW ssh session to this node now (keep this one open), then answer here."
+    read -r -p "Does the new session work? [y/N] " ANSWER
+    systemctl stop nt-ufw-rollback.timer
+    if [[ "${ANSWER}" =~ ^[Yy]$ ]]; then
+        ok "Firewall confirmed."
+    else
+        ufw disable > /dev/null
+        err "Firewall disabled again. Fix MGMT_ALLOW_FROM in ${ENV_FILE} and re-run setup.sh."
+        exit 1
+    fi
+fi
+
 ok "\n[DONE] Processing node setup is done."
 echo ""
 echo -e "\033[1;33mNext steps:\033[0m"
 echo -e "\033[1;33m   1. Edit ${ENV_FILE}\033[0m"
-echo -e "\033[1;33m   2. Add the capturing node's SSH public key to ${AUTHORIZED_KEYS}"
-echo -e "\033[1;33m   3. Run: sudo ./scripts/start.sh\033[0m"
-echo -e "\033[1;33m   4. Register each capturing node (it delivers its files to ${DATA_DIR}/<sensor_id>/, i.e. REMOTE_DIR on that node):\033[0m"
-echo -e "\033[1;33m      ${VENV_DIR}/bin/python -m src.registry add-sensor <sensor_id> --exporter <node_ip>:9100\033[0m"
-echo -e "\033[1;33m      ${VENV_DIR}/bin/python -m src.registry add-prefix <sensor_id> <its DARKNET_NETS prefixes>\033[0m"
+echo -e "\033[1;33m   2. Run: sudo ./scripts/start.sh\033[0m"
+echo -e "\033[1;33m   3. Register each capturing node: run the 'add-sensor.sh' command that its setup script prints\033[0m"
+echo -e "\033[1;33m   4. The capturing nodes ask you to confirm this SSH host key on their first setup:\033[0m"
+echo -e "\033[1;33m      $(ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub 2>/dev/null || echo 'ed25519 host key not found')\033[0m"

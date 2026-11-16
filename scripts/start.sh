@@ -79,6 +79,14 @@ else
     ok "prometheus.yml generated."
 fi
 
+CH_DIR="${CLICKHOUSE_DATA_DIR:-${DOCKER_DIR}/clickhouse}"
+if [[ -d "${CH_DIR}/clickhouse_data" ]]; then
+    ok "ClickHouse storage exists: ${CH_DIR}"
+else
+    err "ClickHouse storage missing: ${CH_DIR} - run setup.sh"
+    ERRORS=$(( ERRORS + 1 ))
+fi
+
 # --Docker compose------------------------------------------------------------
 log "Starting Docker Compose stack..."
 docker compose -f "${COMPOSE_FILE}" --env-file "${ENV_FILE}" up -d

@@ -7,7 +7,7 @@
     python -m src.registry remove-prefix SENSOR_ID CIDR [CIDR ...]
     python -m src.registry sync-targets
 
-A node delivers its PCAP files to <inbox>/<SENSOR_ID>/ (REMOTE_DIR on the capturing node). Files of a sensor that is not
+A node delivers its PCAP files to <inbox>/<SENSOR_ID>/ (its SSH key is locked to that directory by scripts/add-sensor.sh). Files of a sensor that is not
 registered, deactivated or without a prefix are held in the inbox, not ingested. Changes apply without a restart.
 """
 from __future__ import annotations

@@ -17,8 +17,8 @@ services:
     container_name: nt_clickhouse
     restart: always
     volumes:
-      - ./clickhouse/clickhouse_data:/var/lib/clickhouse
-      - ./clickhouse/clickhouse_logs:/var/log/clickhouse-server
+      - ${CLICKHOUSE_DATA_DIR:-./clickhouse}/clickhouse_data:/var/lib/clickhouse
+      - ${CLICKHOUSE_DATA_DIR:-./clickhouse}/clickhouse_logs:/var/log/clickhouse-server
       - ./clickhouse/init-db:/docker-entrypoint-initdb.d:ro
     environment:
       CLICKHOUSE_DB: ${CLICKHOUSE_DB}
@@ -74,7 +74,7 @@ services:
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-telescope}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-change_me_in_production}
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
 
 volumes:
   prometheus-data:
