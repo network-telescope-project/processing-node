@@ -22,7 +22,8 @@ from src.lifecycle.data_lifecycle_manager import (
     PCAP_QUARANTINE_DIR,
     file_sha256,
 )
-from src.registry.sensor_registry import LOCAL_SENSOR_ID, SENSOR_ID, SensorNotReady, SensorRegistry
+from src.registry.branches import MAX_BYTES as MANIFEST_MAX_BYTES, ManifestError, parse_manifest
+from src.registry.sensor_registry import LOCAL_SENSOR_ID, SENSOR_ID, RegistryError, SensorNotReady, SensorRegistry
 from src.health.health_monitoring_manager import HealthMonitoringManager
 from src.health.ingest_watchdog import IngestWatchdog
 from src.db import get_client
@@ -117,6 +118,40 @@ def process_pcap_file(
     return False
 
 
+def process_branch_manifest(filepath: Path, lifecycle: DataLifecycleManager, registry: SensorRegistry) -> bool:
+    """Load the branch assignment a capturing node delivered (branches_<hash>.tsv) into mgmt.ip_branches.
+    Returns True if the file was held in the inbox (sensor not ready)."""
+    sensor_id = filepath.parent.name
+    try:
+        written_at = datetime.fromtimestamp(filepath.stat().st_mtime, timezone.utc)
+        try:
+            darknet = registry.darknet_for(sensor_id, written_at)
+        except SensorNotReady as e:
+            lifecycle.report_held(sensor_id, str(e))
+            return True
+
+        sha256 = file_sha256(filepath)
+        try:
+            if filepath.stat().st_size > MANIFEST_MAX_BYTES:
+                raise ManifestError(f"larger than {MANIFEST_MAX_BYTES} bytes")
+            manifest = parse_manifest(filepath.read_text(encoding="ascii"))
+            changed = registry.import_branches(sensor_id, manifest, sha256, written_at, darknet)
+        except (ManifestError, RegistryError, UnicodeDecodeError) as e:
+            lifecycle.quarantine_pcap(filepath, sensor_id, f"branch assignment rejected: {e}", sha256)
+            return False
+
+        if changed:
+            split = ", ".join(f"{n} {branch}" for branch, n in manifest.counts().items())
+            lifecycle.alert(
+                f"[Network Telescope] {sensor_id}: NEW BRANCH ASSIGNMENT in force from {written_at:%Y-%m-%d %H:%M:%S} UTC: "
+                f"{split} (seed {manifest.seed or '-'}, {filepath.name})"
+            )
+        lifecycle.archive_pcap(filepath, sensor_id)
+    except Exception as e:
+        logger.exception(f"Failed to process {sensor_id}/{filepath.name}: {e}")
+    return False
+
+
 def scan_inbox(
     parser: PcapParser,
     enricher: MetadataEnricher,
@@ -146,6 +181,11 @@ def scan_inbox(
             candidates.add(pcap)
 
     held = 0
+    # Branch assignments of the sensors, before their packets
+    for manifest in sorted(PCAP_INBOX_DIR.glob("*/branches_*.tsv")):
+        if SENSOR_ID.match(manifest.parent.name) and (now - manifest.stat().st_mtime) > READY_AGE_SECONDS:
+            held += process_branch_manifest(manifest, lifecycle, registry)
+
     for filepath in sorted(candidates):
         sensor_id = sensor_of(filepath)
         if sensor_id is None:

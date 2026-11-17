@@ -231,6 +231,11 @@ class DataLifecycleManager:
         except Exception as e:
             logger.warning(f"Alert webhook failed: {e}")
 
+    def alert(self, msg: str) -> None:
+        """Alert for the operator: logged and sent to the alert webhook"""
+        logger.warning(msg)
+        self._send_alert(msg)
+
     def ensure_dirs(self, inbox: Path) -> None:
         for d in (self._archive_dir, self._quarantine_dir):
             d.mkdir(parents=True, exist_ok=True)

@@ -86,18 +86,6 @@ else
     ok "Docker Compose: $(docker compose version)"
 fi
 
-# --Environment file---------------------------------------------------------
-if [[ ! -f "${ENV_FILE}" ]]; then
-    cp "${PROJECT_ROOT}/.env.example" "${ENV_FILE}"
-    warn ".env created from .env.example - edit before running start.sh"
-    warn "  sudo nano ${ENV_FILE}"
-else
-    log ".env already exists."
-fi
-chown "root:${NT_GROUP}" "${ENV_FILE}"
-chmod 640 "${ENV_FILE}"
-set -a; source "${ENV_FILE}"; set +a
-
 # --User and directories-----------------------------------------------------
 log "Creating user and directories"
 if ! getent group "${NT_GROUP}" &>/dev/null; then
@@ -113,6 +101,18 @@ fi
 
 mkdir -p "${DATA_DIR}" "${ARCHIVE_DIR}" "${QUARANTINE_DIR}" "${CONF_DIR}"
 chown -R "${NT_USER}:${NT_USER}" "${DATA_DIR}" "${ARCHIVE_DIR}" "${QUARANTINE_DIR}"
+
+# --Environment file---------------------------------------------------------
+if [[ ! -f "${ENV_FILE}" ]]; then
+    cp "${PROJECT_ROOT}/.env.example" "${ENV_FILE}"
+    warn ".env created from .env.example - edit before running start.sh"
+    warn "  sudo nano ${ENV_FILE}"
+else
+    log ".env already exists."
+fi
+chown "root:${NT_GROUP}" "${ENV_FILE}"
+chmod 640 "${ENV_FILE}"
+set -a; source "${ENV_FILE}"; set +a
 
 # Docker bind-mount dirs
 DOCKER_DIR="${PROJECT_ROOT}/docker"

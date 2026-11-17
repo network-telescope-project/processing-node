@@ -5,13 +5,13 @@ import json
 import os
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from src.parser.pcap_parser import Darknet
+from src.registry.branches import Manifest
 
 LOCAL_SENSOR_ID = "local"   # Single-node local Docker setup
-MODES = ("passive", "reactive")
 SENSOR_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 EXPORTER = re.compile(r"^[A-Za-z0-9._-]+:\d{1,5}$")
 
@@ -69,15 +69,15 @@ class SensorRegistry:
         ids = [s.sensor_id for s in self.sensors() if s.active]
         return ids or [LOCAL_SENSOR_ID]
 
-    def prefixes(self, sensor_id: str | None = None, open_only: bool = True) -> list[tuple[str, str, datetime, datetime | None, str]]:
-        """(sensor_id, prefix, valid_from, valid_to, mode) rows, optionally of one sensor and only the still valid ones"""
+    def prefixes(self, sensor_id: str | None = None, open_only: bool = True) -> list[tuple[str, str, datetime, datetime | None]]:
+        """(sensor_id, prefix, valid_from, valid_to) rows, optionally of one sensor and only the still valid ones"""
         where = ["1"]
         if open_only:
             where.append("valid_to IS NULL")
         if sensor_id:
             where.append("sensor_id = {s:String}")
         return self._db.query(
-            "SELECT sensor_id, prefix, valid_from, valid_to, mode FROM mgmt.sensor_prefixes FINAL "
+            "SELECT sensor_id, prefix, valid_from, valid_to FROM mgmt.sensor_prefixes FINAL "
             f"WHERE {' AND '.join(where)} ORDER BY sensor_id, prefix, valid_from",
             parameters={"s": sensor_id or ""},
         ).result_rows
@@ -137,22 +137,20 @@ class SensorRegistry:
         if exporter and not EXPORTER.match(exporter):
             raise RegistryError(f"exporter {exporter!r}: expected host:port")
 
-    def add_prefix(self, sensor_id: str, prefix: str, mode: str = "passive") -> str:
+    def add_prefix(self, sensor_id: str, prefix: str) -> str:
         """Start monitoring a prefix now; returns its normalized form. A prefix is never shared between sensors.
-        To change the mode of a monitored prefix, remove it and add it again."""
-        if mode not in MODES:
-            raise RegistryError(f"mode {mode!r}: expected one of {', '.join(MODES)}")
+        Which of its addresses are answered is not set here: the node delivers that (import_branches)."""
         net = ipaddress.ip_network(normalize_prefix(prefix))
         if self.get_sensor(sensor_id) is None:
             raise RegistryError(f"unknown sensor '{sensor_id}'")
-        for owner, other, _, _, _ in self.prefixes():
+        for owner, other, _, _ in self.prefixes():
             if ipaddress.ip_network(other).overlaps(net):
                 if owner == sensor_id and other == str(net):
                     raise RegistryError(f"{net} is already monitored by '{sensor_id}'")
                 raise RegistryError(f"{net} overlaps {other}, monitored by '{owner}'")
         self._db.insert(
-            "sensor_prefixes", [[sensor_id, str(net), datetime.now(tz=timezone.utc), None, mode]], database="mgmt",
-            column_names=["sensor_id", "prefix", "valid_from", "valid_to", "mode"],
+            "sensor_prefixes", [[sensor_id, str(net), datetime.now(tz=timezone.utc), None]], database="mgmt",
+            column_names=["sensor_id", "prefix", "valid_from", "valid_to"],
         )
         return str(net)
 
@@ -163,10 +161,47 @@ class SensorRegistry:
         if not rows:
             raise RegistryError(f"'{sensor_id}' does not monitor {prefix}")
         self._db.insert(
-            "sensor_prefixes", [[sensor_id, prefix, rows[0][2], datetime.now(tz=timezone.utc), rows[0][4]]], database="mgmt",
-            column_names=["sensor_id", "prefix", "valid_from", "valid_to", "mode"],
+            "sensor_prefixes", [[sensor_id, prefix, rows[0][2], datetime.now(tz=timezone.utc)]], database="mgmt",
+            column_names=["sensor_id", "prefix", "valid_from", "valid_to"],
         )
         return prefix
+
+    # --- branches (append-only) --------------------------------------------------------------------------
+    def branch_assignments(self, sensor_id: str | None = None) -> list[tuple[str, datetime, str, int, dict[str, int]]]:
+        """(sensor_id, valid_from, manifest sha256, seed, addresses per branch) of every assignment delivered, oldest
+        first; the last one of a sensor is the one in force"""
+        rows = self._db.query(
+            "SELECT sensor_id, valid_from, manifest, seed, branch, count() FROM mgmt.ip_branches "
+            "WHERE {s:String} = '' OR sensor_id = {s:String} "
+            "GROUP BY sensor_id, valid_from, manifest, seed, branch ORDER BY sensor_id, valid_from",
+            parameters={"s": sensor_id or ""},
+        ).result_rows
+        found: dict[tuple, dict[str, int]] = {}
+        for sensor, valid_from, manifest, seed, branch, n in rows:
+            found.setdefault((sensor, valid_from, manifest, seed), {})[branch] = n
+        return [(*key, counts) for key, counts in found.items()]
+
+    def import_branches(self, sensor_id: str, manifest: Manifest, sha256: str, written_at: datetime, darknet: Darknet) -> bool:
+        """Make a delivered branch assignment the one in force from written_at on. Returns False if it already is
+        the one in force (the node sends it on every start). Every address must be monitored by the sensor."""
+        for ip, _, _ in manifest.rows:
+            if int(ip) not in darknet:
+                raise RegistryError(f"{ip} is not in the address space monitored by '{sensor_id}'")
+        known = self.branch_assignments(sensor_id)
+        if known and known[-1][2] == sha256:
+            return False
+        # Two assignments must not share a start time, or both would be "the one in force"
+        taken = {valid_from.replace(tzinfo=timezone.utc) for _, valid_from, _, _, _ in known}
+        valid_from = min(written_at, datetime.now(tz=timezone.utc)).replace(microsecond=0)
+        while valid_from in taken:
+            valid_from += timedelta(seconds=1)
+        self._db.insert(
+            "ip_branches",
+            [[sensor_id, ip, branch, flag, valid_from, sha256, manifest.seed] for ip, branch, flag in manifest.rows],
+            database="mgmt",
+            column_names=["sensor_id", "ip", "branch", "flag", "valid_from", "manifest", "seed"],
+        )
+        return True
 
     # --- Prometheus --------------------------------------------------------------------------------------
     def write_prometheus_targets(self, path: Path) -> bool:
