@@ -152,6 +152,39 @@ if [[ -d "${QUARANTINE_DIR}" ]]; then
     [[ ${QUARANTINED} -gt 0 ]] && warn "${QUARANTINED} PCAP file(s) in quarantine (failed to parse): ${QUARANTINE_DIR}"
 fi
 
+# --WireGuard tunnel of the capturing nodes-----------------------------------
+WG_IF="wg-nt"
+WG_CONF="/etc/wireguard/${WG_IF}.conf"
+HANDSHAKE_MAX_AGE=180
+echo ""
+check_or_start_service "wg-quick@${WG_IF}"
+if [[ "${WG_WRAPPER:-tcp}" == "tcp" ]]; then
+    check_or_start_service nt-wstunnel
+fi
+if [[ "$(ufw status 2>/dev/null)" == "Status: active"* ]]; then
+    ok "Firewall active"
+else
+    err "Firewall is not active - run setup.sh"
+    ERRORS=$(( ERRORS + 1 ))
+fi
+if wg show "${WG_IF}" > /dev/null 2>&1; then
+    NOW=$(date +%s)
+    PEERS=0
+    while read -r pubkey last; do
+        PEERS=$(( PEERS + 1 ))
+        sensor=$(awk -v pub="${pubkey}" '/^# nt-sensor:/ { id = substr($0, 13) } $1 == "PublicKey" && $3 == pub { print id; exit }' "${WG_CONF}")
+        if [[ "${last}" -eq 0 ]]; then
+            warn "Tunnel: ${sensor:-unknown peer} has not connected yet"
+        elif (( NOW - last > HANDSHAKE_MAX_AGE )); then
+            err "Tunnel: ${sensor:-unknown peer} last seen $(( NOW - last )) s ago - is the node down or its tunnel broken?"
+            ERRORS=$(( ERRORS + 1 ))
+        else
+            ok "Tunnel: ${sensor:-unknown peer} connected ($(( NOW - last )) s ago)"
+        fi
+    done < <(wg show "${WG_IF}" latest-handshakes)
+    [[ ${PEERS} -gt 0 ]] || warn "Tunnel: no capturing node registered yet (scripts/add-sensor.sh)"
+fi
+
 # --Systemd service-----------------------------------------------------------
 echo ""
 check_or_start_service nt-processing

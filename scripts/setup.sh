@@ -17,6 +17,21 @@ VENV_DIR="${PROJECT_ROOT}/.venv"
 ENV_FILE="${PROJECT_ROOT}/.env"
 SSH_DIR="/home/${NT_USER}/.ssh"
 
+# WireGuard tunnel from the capturing nodes
+WG_IF="wg-nt"
+WG_CONF="/etc/wireguard/${WG_IF}.conf"
+WG_KEY="/etc/wireguard/${WG_IF}.key"
+WG_SELF="10.77.0.1/24"
+WG_MTU=1280
+
+# wstunnel (carries WireGuard over TCP)
+WSTUNNEL_VERSION="11.1.0"
+declare -A WSTUNNEL_SHA256=(
+    [amd64]="512edf4e7bb64fc133522220123514868fae75b5bae4124b53e396787276aa23"
+    [arm64]="148895f957a68be39e2b65d28c5f2065b9c58c4a0cfd48c560b2b3267f398464"
+)
+WSTUNNEL_BIN="/usr/local/bin/wstunnel"
+
 # --Helpers-------------------------------------------------------------------
 log()  { echo "[*] $*"; }
 ok()   { echo -e "\033[1;32m[+]\033[0m $*"; }
@@ -28,6 +43,30 @@ require_root() {
        exit 1
     fi
  }
+
+install_wstunnel() {
+    if [[ "$("${WSTUNNEL_BIN}" --version 2>/dev/null)" == "wstunnel-cli ${WSTUNNEL_VERSION}" ]]; then
+        ok "wstunnel ${WSTUNNEL_VERSION} installed."
+        return
+    fi
+    local arch sha tmp
+    arch=$(dpkg --print-architecture)
+    sha="${WSTUNNEL_SHA256[${arch}]:-}"
+    [[ -n "${sha}" ]] || { err "No pinned wstunnel build for architecture '${arch}'."; exit 1; }
+    tmp=$(mktemp -d)
+    log "Installing wstunnel ${WSTUNNEL_VERSION} (${arch})..."
+    if ! curl -fsSL --retry 3 -o "${tmp}/wstunnel.tar.gz" \
+            "https://github.com/erebe/wstunnel/releases/download/v${WSTUNNEL_VERSION}/wstunnel_${WSTUNNEL_VERSION}_linux_${arch}.tar.gz" \
+        || ! echo "${sha}  ${tmp}/wstunnel.tar.gz" | sha256sum -c --quiet; then
+        rm -rf "${tmp}"
+        err "wstunnel download failed or its checksum does not match - not installed."
+        exit 1
+    fi
+    tar -xzf "${tmp}/wstunnel.tar.gz" -C "${tmp}" wstunnel
+    install -m 755 -o root -g root "${tmp}/wstunnel" "${WSTUNNEL_BIN}"
+    rm -rf "${tmp}"
+    ok "wstunnel ${WSTUNNEL_VERSION} installed: ${WSTUNNEL_BIN}"
+}
 
 # --Pre flight----------------------------------------------------------------
 require_root
@@ -45,7 +84,7 @@ if [[ "${PROJECT_ROOT}" == /home/* || "${PROJECT_ROOT}" == /root/* ]]; then
 fi
 
 # --Dependencies--------------------------------------------------------------
-SYSTEM_DEPS=("python3" "python3-venv" "python3-pip" "curl" "git" "rsync" "openssh-server" "ufw" "jq" "gettext-base")
+SYSTEM_DEPS=("python3" "python3-venv" "python3-pip" "curl" "git" "rsync" "openssh-server" "ufw" "jq" "gettext-base" "wireguard-tools")
 MISSING_DEPS=()
 
 log "Auditing PROCESSING node dependencies..."
@@ -198,6 +237,73 @@ else
     fi
 fi
 
+# --WireGuard tunnel---------------------------------------------------------
+WG_PORT="${WG_PORT:-8501}"
+WG_WRAPPER="${WG_WRAPPER:-tcp}"
+if [[ ! "${WG_WRAPPER}" =~ ^(tcp|none)$ || ! "${WG_PORT}" =~ ^[0-9]+$ ]]; then
+    err "WG_WRAPPER must be tcp or none and WG_PORT a port number (${ENV_FILE})."
+    exit 1
+fi
+log "Configuring the WireGuard tunnel (${WG_IF}, port ${WG_PORT}, wrapper: ${WG_WRAPPER})..."
+if [[ ! -f "${WG_KEY}" ]]; then
+    (umask 077 && wg genkey > "${WG_KEY}")
+    ok "WireGuard key generated: ${WG_KEY}"
+fi
+if [[ ! -f "${WG_CONF}" ]]; then
+    (umask 077 && cat > "${WG_CONF}" <<EOF
+[Interface]
+Address = ${WG_SELF}
+ListenPort = ${WG_PORT}
+MTU = ${WG_MTU}
+PostUp = wg set %i private-key ${WG_KEY}
+
+EOF
+    )
+    ok "WireGuard configuration created: ${WG_CONF}"
+else
+    sed -i "s|^ListenPort = .*|ListenPort = ${WG_PORT}|" "${WG_CONF}"
+fi
+systemctl enable "wg-quick@${WG_IF}" > /dev/null 2>&1
+systemctl restart "wg-quick@${WG_IF}"
+ok "WireGuard tunnel up: ${WG_IF} ${WG_SELF}, public key $(wg pubkey < "${WG_KEY}")"
+
+# wstunnel server
+WSTUNNEL_UNIT="/etc/systemd/system/nt-wstunnel.service"
+if [[ "${WG_WRAPPER}" == "tcp" ]]; then
+    install_wstunnel
+    cat > "${WSTUNNEL_UNIT}" <<EOF
+[Unit]
+Description=Network Telescope - WireGuard of the capturing nodes over TCP (wstunnel server)
+After=network-online.target wg-quick@${WG_IF}.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${WSTUNNEL_BIN} server --log-lvl WARN --restrict-to 127.0.0.1:${WG_PORT} ws://0.0.0.0:${WG_PORT}
+Restart=always
+RestartSec=5
+DynamicUser=yes
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+SyslogIdentifier=nt-wstunnel
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable nt-wstunnel > /dev/null 2>&1
+    systemctl restart nt-wstunnel
+    ok "wstunnel server listens on TCP ${WG_PORT}."
+elif [[ -f "${WSTUNNEL_UNIT}" ]]; then
+    systemctl disable --now nt-wstunnel > /dev/null 2>&1 || true
+    rm -f "${WSTUNNEL_UNIT}"
+    systemctl daemon-reload
+    ok "WG_WRAPPER=none: wstunnel server removed, the nodes use UDP ${WG_PORT} directly."
+fi
+
 # TODO grafana dashboard is complete shit - has to be remade
 
 # --Systemd service for processing-------------------------------------------
@@ -238,10 +344,11 @@ fi
 ufw default deny incoming > /dev/null
 ufw default allow outgoing > /dev/null
 ufw allow proto tcp from "${MGMT_ALLOW_FROM}" to any port 22 comment "nt-mgmt-ssh" > /dev/null
+ufw allow in on "${WG_IF}" proto tcp to any port "${SSH_PORT}" comment "nt-ingest" > /dev/null
 # Prometheus (in a Docker bridge network) scrapes the pipeline's /metrics on the host
 ufw allow proto tcp from 172.16.0.0/12 to any port "${METRICS_PORT:-8000}" comment "nt-docker-metrics" > /dev/null
 
-if ufw status | grep -q "^Status: active"; then
+if [[ "$(ufw status 2>/dev/null)" == "Status: active"* ]]; then
     ok "Firewall already active - rules updated."
 else
     systemd-run --quiet --unit=nt-ufw-rollback --on-active=5min /usr/sbin/ufw disable
