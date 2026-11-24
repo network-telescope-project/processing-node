@@ -1,4 +1,3 @@
-# TODO make sure "docker compose" sees and can read/load the environment variables
 services:
   geoipupdate:
     image: ghcr.io/maxmind/geoipupdate:v7.0.1
@@ -20,10 +19,12 @@ services:
       - ${CLICKHOUSE_DATA_DIR:-./clickhouse}/clickhouse_data:/var/lib/clickhouse
       - ${CLICKHOUSE_DATA_DIR:-./clickhouse}/clickhouse_logs:/var/log/clickhouse-server
       - ./clickhouse/init-db:/docker-entrypoint-initdb.d:ro
+      - ./clickhouse/users.d/nt-reader.xml:/etc/clickhouse-server/users.d/nt-reader.xml:ro
     environment:
       CLICKHOUSE_DB: ${CLICKHOUSE_DB}
       CLICKHOUSE_USER: ${CLICKHOUSE_USER}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_RO_PASSWORD: ${CLICKHOUSE_RO_PASSWORD:?set it in .env (see .env.example)}
     healthcheck:
       test: ["CMD", "clickhouse-client",
              "--user=${CLICKHOUSE_USER}",
@@ -71,8 +72,7 @@ services:
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_USER}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
-      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-telescope}
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-change_me_in_production}
+      CLICKHOUSE_RO_PASSWORD: ${CLICKHOUSE_RO_PASSWORD}
     ports:
       - "127.0.0.1:3000:3000"
 

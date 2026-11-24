@@ -68,6 +68,43 @@ install_wstunnel() {
     ok "wstunnel ${WSTUNNEL_VERSION} installed: ${WSTUNNEL_BIN}"
 }
 
+# Time sync
+sync_clock() {
+    timedatectl set-ntp true 2>/dev/null || true
+    for _ in $(seq 1 20); do
+        if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == "yes" ]]; then
+            ok "Clock synchronised (NTP): $(date -u '+%Y-%m-%d %H:%M:%S') UTC"
+            return
+        fi
+        sleep 1
+    done
+
+    local host before after header server offsets=()
+    for host in www.debian.org www.google.com www.cloudflare.com www.wikipedia.org; do
+        before=$(date +%s%3N)
+        header=$(curl -sI --max-time 5 "https://${host}" 2>/dev/null | tr -d '\r' | sed -n 's/^[Dd]ate: //p' | head -1) || true
+        after=$(date +%s%3N)
+        [[ -n "${header}" ]] && server=$(date -d "${header}" +%s 2>/dev/null) || continue
+        offsets+=($(( server * 1000 + 500 - (before + after) / 2 )))
+        [[ ${#offsets[@]} -eq 3 ]] && break
+    done
+    if [[ ${#offsets[@]} -lt 3 ]]; then
+        warn "Clock NOT verified: NTP does not answer and neither do enough web servers. Set it by hand (date -u -s '...')."
+        return
+    fi
+    local sorted diff
+    mapfile -t sorted < <(printf '%s\n' "${offsets[@]}" | sort -n)
+    diff=${sorted[1]}
+    if (( sorted[2] - diff > 2000 && diff - sorted[0] > 2000 )); then
+        warn "Clock NOT verified: the web servers disagree (offsets ${sorted[*]} ms). Check it by hand: $(date -u)"
+    elif (( diff >= -2000 && diff <= 2000 )); then
+        ok "Clock OK: within 2 s of the web servers (no NTP)"
+    else
+        date -s "@$(( ($(date +%s%3N) + diff) / 1000 ))" > /dev/null
+        ok "Clock was off by $(( diff / 1000 )) s, set from the web servers (no NTP): $(date -u '+%Y-%m-%d %H:%M:%S') UTC"
+    fi
+}
+
 # --Pre flight----------------------------------------------------------------
 require_root
 
@@ -84,7 +121,7 @@ if [[ "${PROJECT_ROOT}" == /home/* || "${PROJECT_ROOT}" == /root/* ]]; then
 fi
 
 # --Dependencies--------------------------------------------------------------
-SYSTEM_DEPS=("python3" "python3-venv" "python3-pip" "curl" "git" "rsync" "openssh-server" "ufw" "jq" "gettext-base" "wireguard-tools")
+SYSTEM_DEPS=("python3" "python3-venv" "python3-pip" "curl" "git" "rsync" "openssh-server" "ufw" "jq" "gettext-base" "wireguard-tools" "prometheus-node-exporter")
 MISSING_DEPS=()
 
 log "Auditing PROCESSING node dependencies..."
@@ -111,12 +148,11 @@ if ! command -v docker &>/dev/null; then
         exit 1
     fi
 
-    systemctl enable --now docker
-
     ok "Docker installed: $(docker --version)"
 else
     ok "Docker: $(docker --version)"
 fi
+systemctl enable --now docker > /dev/null 2>&1
 
 if ! docker compose version &>/dev/null; then
     err "Docker Compose v2 not found. Please install the docker-compose-plugin."
@@ -124,6 +160,9 @@ if ! docker compose version &>/dev/null; then
 else
     ok "Docker Compose: $(docker compose version)"
 fi
+
+# --Clock--------------------------------------------------------------------
+sync_clock
 
 # --User and directories-----------------------------------------------------
 log "Creating user and directories"
@@ -304,7 +343,9 @@ elif [[ -f "${WSTUNNEL_UNIT}" ]]; then
     ok "WG_WRAPPER=none: wstunnel server removed, the nodes use UDP ${WG_PORT} directly."
 fi
 
-# TODO grafana dashboard is complete shit - has to be remade
+# --Node exporter (processing node's health, scraped by Prometheus)----------
+systemctl enable --now prometheus-node-exporter > /dev/null 2>&1
+ok "prometheus-node-exporter running on port 9100 (closed to the outside by the firewall)."
 
 # --Systemd service for processing-------------------------------------------
 cat > /etc/systemd/system/nt-processing.service <<EOF
@@ -345,8 +386,9 @@ ufw default deny incoming > /dev/null
 ufw default allow outgoing > /dev/null
 ufw allow proto tcp from "${MGMT_ALLOW_FROM}" to any port 22 comment "nt-mgmt-ssh" > /dev/null
 ufw allow in on "${WG_IF}" proto tcp to any port "${SSH_PORT}" comment "nt-ingest" > /dev/null
-# Prometheus (in a Docker bridge network) scrapes the pipeline's /metrics on the host
+# Prometheus (in a Docker bridge network) scrapes the pipeline's /metrics and the node-exporter on the host
 ufw allow proto tcp from 172.16.0.0/12 to any port "${METRICS_PORT:-8000}" comment "nt-docker-metrics" > /dev/null
+ufw allow proto tcp from 172.16.0.0/12 to any port 9100 comment "nt-docker-exporter" > /dev/null
 
 if [[ "$(ufw status 2>/dev/null)" == "Status: active"* ]]; then
     ok "Firewall already active - rules updated."

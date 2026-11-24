@@ -6,13 +6,13 @@ import logging
 import os
 import shutil
 import time
-import requests
 import zstandard
 from datetime import datetime, timezone
 from pathlib import Path
 
 from prometheus_client import Counter, Gauge
 
+from src.health import alerts
 from src.parser.pcap_parser import PARSER_VERSION, Packet, ParseStats
 
 logger = logging.getLogger(__name__)
@@ -76,7 +76,10 @@ DONE_STATUSES = ("ingested", "empty")
 
 INSERT_BATCH_SIZE = int(os.environ.get("INSERT_BATCH_SIZE", "10000"))
 SOURCE_LOOKUP_BATCH = 5000      # addresses per "which sources are new" query
-INGESTION_DROP_THRESHOLD = float(os.environ.get("INGESTION_DROP_THRESHOLD", "0.90"))
+
+VOLUME_DROP_THRESHOLD = 0.90
+VOLUME_MIN_FILES = 6
+VOLUME_MIN_SECONDS = 600
 
 PCAP_ARCHIVE_DIR = Path(os.environ.get("PCAP_ARCHIVE_DIR", "/var/lib/network-telescope/data/archive"))
 PCAP_QUARANTINE_DIR = Path(os.environ.get("PCAP_QUARANTINE_DIR", "/var/lib/network-telescope/data/quarantine"))
@@ -111,9 +114,8 @@ def file_sha256(path: Path) -> str:
 class DataLifecycleManager:
     def __init__(self, db_client):
         self._db = db_client
-        self._last_ingestion_pps: float | None = None
         self._held_reported: set[tuple[str, str]] = set()
-        self._alert_webhook = os.environ.get("ALERT_WEBHOOK_URL", "")
+        self._conditions = alerts.Conditions()
         self._archive_dir = PCAP_ARCHIVE_DIR
         self._quarantine_dir = PCAP_QUARANTINE_DIR
 
@@ -145,9 +147,7 @@ class DataLifecycleManager:
         if (sensor_id, reason) in self._held_reported:
             return
         self._held_reported.add((sensor_id, reason))
-        msg = f"[Network Telescope] FILES HELD in the inbox: {reason}. Register it with `python -m src.registry`; they are ingested once it is ready."
-        logger.warning(msg)
-        self._send_alert(msg)
+        alerts.send(f"FILES HELD in the inbox: {reason}. Register it with `python -m src.registry`; they are ingested once it is ready.")
 
     def log_file(
         self,
@@ -199,42 +199,33 @@ class DataLifecycleManager:
                 "source_enrichment", rows, column_names=SOURCE_COLUMNS, column_type_names=SOURCE_COLUMN_TYPES
             )
 
-    def check_ingestion_speed(self, inserted: int, elapsed: float) -> None:
-        """Compares the speed of this file (parse + enrich + insert) with the previous one."""
-        if elapsed > 0 and inserted > 0:
-            current_pps = inserted / elapsed
-            self._check_ingestion_drop(current_pps)
-            self._last_ingestion_pps = current_pps
+    def check_volume(self, filepath: Path, sensor_id: str, stats: ParseStats, inserted: int) -> None:
+        """Alert when a file has far fewer packets per second than usual."""
+        seconds = 0.0
+        end = filepath.stat().st_mtime
+        if inserted and stats.ts_min and stats.ts_max:
+            seconds = (stats.ts_max - stats.ts_min).total_seconds()
+            end = stats.ts_max.timestamp()
+            if seconds < VOLUME_MIN_SECONDS:
+                return
+        rate = inserted / seconds if seconds else 0.0
 
-    def _check_ingestion_drop(self, current_pps: float) -> None:
-        if self._last_ingestion_pps is None or self._last_ingestion_pps == 0:
+        end_ms = int(end * 1000)
+        files, usual = self._db.query(
+            "WITH toUnixTimestamp64Milli(assumeNotNull(ts_min)) AS first, toUnixTimestamp64Milli(assumeNotNull(ts_max)) AS last "
+            "SELECT count(), median(1000 * inserted / (last - first)) FROM pcap_ingest_log "
+            "WHERE sensor_id = {s:String} AND status = 'ingested' AND file_name != {f:String} AND ts_min IS NOT NULL "
+            "AND last > {end:Int64} - 86400000 AND last <= {end:Int64} AND last - first >= {min:Int64}",
+            parameters={"s": sensor_id, "f": filepath.name, "end": end_ms, "min": VOLUME_MIN_SECONDS * 1000},
+        ).result_rows[0]
+        if files < VOLUME_MIN_FILES or not usual:
             return
-        drop_fraction = 1.0 - (current_pps / self._last_ingestion_pps)
-        if drop_fraction > INGESTION_DROP_THRESHOLD:
-            msg = (
-                f"[Network Telescope] INGESTION DROP ALERT: "
-                f"{self._last_ingestion_pps:.1f} → {current_pps:.1f} pkt/s "
-                f"({drop_fraction * 100:.0f}% drop between consecutive files)"
-            )
-            logger.warning(msg)
-            if self._alert_webhook:
-                try:
-                    requests.post(self._alert_webhook, json={"text": msg}, timeout=5)
-                except Exception as e:
-                    logger.warning(f"Ingestion alert webhook failed: {e}")
-
-    def _send_alert(self, msg: str) -> None:
-        if not self._alert_webhook:
-            return
-        try:
-            requests.post(self._alert_webhook, json={"text": msg}, timeout=5)
-        except Exception as e:
-            logger.warning(f"Alert webhook failed: {e}")
-
-    def alert(self, msg: str) -> None:
-        """Alert for the operator: logged and sent to the alert webhook"""
-        logger.warning(msg)
-        self._send_alert(msg)
+        low = rate < (1 - VOLUME_DROP_THRESHOLD) * usual
+        self._conditions.update(
+            (sensor_id, "volume"),
+            f"{sensor_id}: TRAFFIC DROP: {filepath.name} has {rate:.2f} packets/s, usually {usual:.2f} (median of the last 24 h)" if low else None,
+            f"{sensor_id}: traffic is back to normal ({rate:.2f} packets/s in {filepath.name})",
+        )
 
     def ensure_dirs(self, inbox: Path) -> None:
         for d in (self._archive_dir, self._quarantine_dir):
@@ -282,9 +273,7 @@ class DataLifecycleManager:
 
         PCAPS_QUARANTINED.inc()
         self.update_quarantine_gauge()
-        msg = f"[Network Telescope] PCAP QUARANTINED: {sensor_id}/{filepath.name} - {reason}"
-        logger.error(msg)
-        self._send_alert(msg)
+        alerts.send(f"PCAP QUARANTINED: {sensor_id}/{filepath.name} - {reason}", logging.ERROR)
 
     def update_quarantine_gauge(self) -> None:
         files = list(self._quarantine_dir.glob("*/*.pcap"))
@@ -354,20 +343,18 @@ class DataLifecycleManager:
             if n:
                 logger.info(f"Archive retention: deleted {n} oldest file(s) ({reason})")
         if pruned["size"] or pruned["free_space"]:
-            msg = (
-                f"[Network Telescope] ARCHIVE FULL: deleted {pruned['size'] + pruned['free_space']} "
+            alerts.send(
+                f"ARCHIVE FULL: deleted {pruned['size'] + pruned['free_space']} "
                 f"file(s) before the {ARCHIVE_MAX_AGE_DAYS}-day limit "
                 f"(size cap: {pruned['size']}, low free disk: {pruned['free_space']})"
             )
-            logger.warning(msg)
-            self._send_alert(msg)
-        if ARCHIVE_MIN_FREE_BYTES > 0 and free < ARCHIVE_MIN_FREE_BYTES:
-            msg = (
-                f"[Network Telescope] DISK LOW: {free / GIB:.1f} GB free, below the "
-                f"{ARCHIVE_MIN_FREE_BYTES / GIB:.0f} GB limit, with nothing left to prune in the archive"
+        if ARCHIVE_MIN_FREE_BYTES > 0:
+            self._conditions.update(
+                ("archive", "disk"),
+                f"DISK LOW: {free / GIB:.1f} GB free, below the {ARCHIVE_MIN_FREE_BYTES / GIB:.0f} GB limit, "
+                "with nothing left to prune in the archive" if free < ARCHIVE_MIN_FREE_BYTES else None,
+                f"disk OK again: {free / GIB:.1f} GB free",
             )
-            logger.error(msg)
-            self._send_alert(msg)
 
         ARCHIVE_FILES.set(len(entries))
         ARCHIVE_BYTES.set(total)

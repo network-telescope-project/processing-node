@@ -1,0 +1,170 @@
+{
+  "uid": "nt-health",
+  "title": "Network Telescope - Health",
+  "tags": ["network-telescope"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "1m",
+  "time": { "from": "now-24h", "to": "now" },
+  "graphTooltip": 1,
+  "editable": true,
+  "links": [
+    { "type": "dashboards", "title": "Dashboards", "tags": ["network-telescope"], "asDropdown": false, "keepTime": true }
+  ],
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1, "type": "table", "title": "Machines now", "description": "The last health check of each machine (every 5 minutes), '_processing' is this machine. An old 'checked' means that nt-processing is not running. Empty cells could not be read",
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 6 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "left", "minWidth": 100 } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "checked" }, "properties": [ { "id": "unit", "value": "dateTimeFromNow" } ] },
+          { "matcher": { "id": "byName", "options": "state" }, "properties": [
+            { "id": "custom.cellOptions", "value": { "type": "color-text" } },
+            { "id": "mappings", "value": [
+              { "type": "value", "options": { "OK": { "text": "✔ OK", "color": "#0ca30c", "index": 0 } } },
+              { "type": "regex", "options": { "pattern": "^(?!OK$)(.+)$", "result": { "text": "✖ $1", "color": "#e66767", "index": 1 } } } ] } ] },
+          { "matcher": { "id": "byRegexp", "options": "/%/" }, "properties": [ { "id": "unit", "value": "percent" }, { "id": "decimals", "value": 0 } ] }
+        ] },
+      "options": { "showHeader": true, "cellHeight": "sm" },
+      "targets": [ { "refId": "A", "editorType": "sql", "queryType": "table", "format": 1,
+        "rawSql": "SELECT sensor_id AS machine, toUnixTimestamp(h.ts) * 1000 AS checked, multiIf(h.ts < now() - 900, 'no recent check', length(problems) > 0, arrayStringConcat(problems, ', '), exporter_up IS NULL, 'not monitored', 'OK') AS state, multiIf(capture_running = 1, 'yes', capture_running = 0, 'no', NULL) AS capturing, capture_cpu_pct AS \"dumpcap CPU %\", unsent_files AS \"files not sent\", units_down AS \"services down\", 100 * disk_avail_bytes / disk_size_bytes AS \"disk free %\", cpu_busy_pct AS \"CPU %\", mem_avail_pct AS \"memory free %\", multiIf(clock_synced = 1, 'yes', clock_synced = 0, 'no', NULL) AS \"clock synced\" FROM telescope.telescope_health AS h WHERE h.ts > now() - INTERVAL 7 DAY ORDER BY h.ts DESC LIMIT 1 BY sensor_id" } ]
+    },
+    {
+      "id": 2, "type": "state-timeline", "title": "Reachable from Prometheus", "description": "Live, one row per machine or service that Prometheus scrapes. A capture node is scraped through its tunnel",
+      "gridPos": { "x": 0, "y": 6, "w": 12, "h": 7 },
+      "datasource": { "type": "prometheus", "uid": "prometheus-telescope" },
+      "fieldConfig": {
+        "defaults": { "custom": { "fillOpacity": 80, "lineWidth": 0 }, "color": { "mode": "fixed", "fixedColor": "text" },
+          "mappings": [ { "type": "value", "options": { "1": { "text": "up", "color": "#0ca30c", "index": 0 }, "0": { "text": "down", "color": "#d03b3b", "index": 1 } } } ] }, "overrides": [] },
+      "options": { "showValue": "auto", "rowHeight": 0.8, "mergeValues": true, "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "single" } },
+      "targets": [
+        { "refId": "A", "expr": "up{job=\"capturing-node\"}", "legendFormat": "{{sensor}}" },
+        { "refId": "B", "expr": "up{job!=\"capturing-node\",job!=\"prometheus\"}", "legendFormat": "{{job}}" }
+      ]
+    },
+    {
+      "id": 3, "type": "timeseries", "title": "Age of the newest PCAP file", "description": "Alert at 2 h (INGEST_STALE_SECONDS). A saw tooth up to 1 h is normal",
+      "gridPos": { "x": 12, "y": 6, "w": 12, "h": 7 },
+      "datasource": { "type": "prometheus", "uid": "prometheus-telescope" },
+      "fieldConfig": { "defaults": { "unit": "s", "min": 0, "color": { "mode": "palette-classic-by-name" }, "custom": { "lineWidth": 2, "fillOpacity": 0, "showPoints": "never", "thresholdsStyle": { "mode": "dashed" } }, "thresholds": { "mode": "absolute", "steps": [ { "color": "transparent", "value": null }, { "color": "#d03b3b", "value": 7200 } ] } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi" } },
+      "targets": [ { "refId": "A", "expr": "telescope_seconds_since_last_file", "legendFormat": "{{sensor}}" } ]
+    },
+    { "id": 20, "type": "row", "title": "Capture nodes", "collapsed": false, "gridPos": { "x": 0, "y": 13, "w": 24, "h": 1 }, "panels": [] },
+    {
+      "id": 4, "type": "timeseries", "title": "dumpcap CPU", "description": "Of one core. Alert at 80 %: the only early sign of lost packets, dumpcap reports its losses only when it stops",
+      "gridPos": { "x": 0, "y": 14, "w": 8, "h": 7 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "displayName": "${__field.labels.sensor_id}", "color": { "mode": "palette-classic-by-name" }, "custom": { "lineWidth": 2, "fillOpacity": 0, "showPoints": "never", "spanNulls": false } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi" } },
+      "targets": [ { "refId": "A", "editorType": "sql", "queryType": "timeseries", "format": 0,
+        "rawSql": "SELECT ts AS time, sensor_id, capture_cpu_pct AS value FROM telescope.telescope_health WHERE $__timeFilter(ts) AND sensor_id != '_processing' ORDER BY time" } ]
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "Files not yet transferred", "description": "Closed PCAP files waiting on the node. It deletes the oldest beyond RING_BUFFER_SIZE",
+      "gridPos": { "x": 8, "y": 14, "w": 8, "h": 7 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "decimals": 0, "displayName": "${__field.labels.sensor_id}", "color": { "mode": "palette-classic-by-name" }, "custom": { "lineWidth": 2, "fillOpacity": 0, "showPoints": "never", "spanNulls": false } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi" } },
+      "targets": [ { "refId": "A", "editorType": "sql", "queryType": "timeseries", "format": 0,
+        "rawSql": "SELECT ts AS time, sensor_id, unsent_files AS value FROM telescope.telescope_health WHERE $__timeFilter(ts) AND sensor_id != '_processing' ORDER BY time" } ]
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "Packets per second dropped before the capture","description": "By the NIC or driver plus by the kernel",
+      "gridPos": { "x": 16, "y": 14, "w": 8, "h": 7 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "displayName": "${__field.labels.sensor_id}", "color": { "mode": "palette-classic-by-name" }, "custom": { "lineWidth": 2, "fillOpacity": 0, "showPoints": "never", "spanNulls": false } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi" } },
+      "targets": [ { "refId": "A", "editorType": "sql", "queryType": "timeseries", "format": 0,
+        "rawSql": "SELECT ts AS time, sensor_id, net_drop_pps + softnet_drop_pps AS value FROM telescope.telescope_health WHERE $__timeFilter(ts) AND sensor_id != '_processing' ORDER BY time" } ]
+    },
+    { "id": 21, "type": "row", "title": "All machines", "collapsed": false, "gridPos": { "x": 0, "y": 21, "w": 24, "h": 1 }, "panels": [] },
+    {
+      "id": 7, "type": "timeseries", "title": "Disk free", "description": "The fullest filesystem with our data. Alert below 20 % (DISK_LOW_THRESHOLD_PCT)",
+      "gridPos": { "x": 0, "y": 22, "w": 8, "h": 7 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100, "displayName": "${__field.labels.sensor_id}", "color": { "mode": "palette-classic-by-name" }, "custom": { "lineWidth": 2, "fillOpacity": 0, "showPoints": "never", "spanNulls": false, "thresholdsStyle": { "mode": "dashed" } }, "thresholds": { "mode": "absolute", "steps": [ { "color": "transparent", "value": null }, { "color": "#d03b3b", "value": 20 } ] } }, "overrides": [ { "matcher": { "id": "byName", "options": "_processing" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#898781" } } ] } ] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi" } },
+      "targets": [ { "refId": "A", "editorType": "sql", "queryType": "timeseries", "format": 0,
+        "rawSql": "SELECT ts AS time, sensor_id, 100 * disk_avail_bytes / disk_size_bytes AS value FROM telescope.telescope_health WHERE $__timeFilter(ts) ORDER BY time" } ]
+    },
+    {
+      "id": 8, "type": "timeseries", "title": "CPU busy",
+      "gridPos": { "x": 8, "y": 22, "w": 8, "h": 7 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100, "displayName": "${__field.labels.sensor_id}", "color": { "mode": "palette-classic-by-name" }, "custom": { "lineWidth": 2, "fillOpacity": 0, "showPoints": "never", "spanNulls": false } }, "overrides": [ { "matcher": { "id": "byName", "options": "_processing" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#898781" } } ] } ] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi" } },
+      "targets": [ { "refId": "A", "editorType": "sql", "queryType": "timeseries", "format": 0,
+        "rawSql": "SELECT ts AS time, sensor_id, cpu_busy_pct AS value FROM telescope.telescope_health WHERE $__timeFilter(ts) ORDER BY time" } ]
+    },
+    {
+      "id": 9, "type": "timeseries", "title": "Memory free",
+      "gridPos": { "x": 16, "y": 22, "w": 8, "h": 7 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100, "displayName": "${__field.labels.sensor_id}", "color": { "mode": "palette-classic-by-name" }, "custom": { "lineWidth": 2, "fillOpacity": 0, "showPoints": "never", "spanNulls": false } }, "overrides": [ { "matcher": { "id": "byName", "options": "_processing" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#898781" } } ] } ] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi" } },
+      "targets": [ { "refId": "A", "editorType": "sql", "queryType": "timeseries", "format": 0,
+        "rawSql": "SELECT ts AS time, sensor_id, mem_avail_pct AS value FROM telescope.telescope_health WHERE $__timeFilter(ts) ORDER BY time" } ]
+    },
+    { "id": 22, "type": "row", "title": "Ingest", "collapsed": false, "gridPos": { "x": 0, "y": 29, "w": 24, "h": 1 }, "panels": [] },
+    {
+      "id": 10, "type": "stat", "title": "Files held", "description": "In the inbox, of a sensor that is not registered or not active",
+      "gridPos": { "x": 0, "y": 30, "w": 4, "h": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus-telescope" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "text" } }, "overrides": [] },
+      "options": { "graphMode": "none", "colorMode": "value", "reduceOptions": { "calcs": ["lastNotNull"], "values": false } },
+      "targets": [ { "refId": "A", "expr": "telescope_held_files", "instant": true } ]
+    },
+    {
+      "id": 11, "type": "stat", "title": "Files in quarantine", "description": "Could not be read",
+      "gridPos": { "x": 0, "y": 34, "w": 4, "h": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus-telescope" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "text" } }, "overrides": [] },
+      "options": { "graphMode": "none", "colorMode": "value", "reduceOptions": { "calcs": ["lastNotNull"], "values": false } },
+      "targets": [ { "refId": "A", "expr": "telescope_quarantine_files", "instant": true } ]
+    },
+    {
+      "id": 12, "type": "stat", "title": "PCAP archive",
+      "gridPos": { "x": 0, "y": 38, "w": 4, "h": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus-telescope" },
+      "fieldConfig": { "defaults": { "unit": "bytes", "color": { "mode": "fixed", "fixedColor": "text" } }, "overrides": [] },
+      "options": { "graphMode": "none", "colorMode": "value", "reduceOptions": { "calcs": ["lastNotNull"], "values": false } },
+      "targets": [ { "refId": "A", "expr": "telescope_archive_bytes", "instant": true } ]
+    },
+    {
+      "id": 13, "type": "timeseries", "title": "Packets per file",
+      "gridPos": { "x": 4, "y": 30, "w": 10, "h": 12 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "displayName": "${__field.labels.sensor_id}", "color": { "mode": "palette-classic-by-name" }, "custom": { "lineWidth": 2, "fillOpacity": 0, "showPoints": "always", "pointSize": 8, "spanNulls": true } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi" } },
+      "targets": [ { "refId": "A", "editorType": "sql", "queryType": "timeseries", "format": 0,
+        "rawSql": "SELECT assumeNotNull(ts_max) AS time, sensor_id, inserted AS value FROM telescope.pcap_ingest_log WHERE status = 'ingested' AND ts_max IS NOT NULL AND $__timeFilter(ts_max) ORDER BY time" } ]
+    },
+    {
+      "id": 14, "type": "timeseries", "title": "Delay from the last packet of a file to its ingest",
+      "gridPos": { "x": 14, "y": 30, "w": 10, "h": 12 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+      "fieldConfig": { "defaults": { "unit": "s", "min": 0, "displayName": "${__field.labels.sensor_id}", "color": { "mode": "palette-classic-by-name" }, "custom": { "lineWidth": 2, "fillOpacity": 0, "showPoints": "always", "pointSize": 8, "spanNulls": true } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi" } },
+      "targets": [ { "refId": "A", "editorType": "sql", "queryType": "timeseries", "format": 0,
+        "rawSql": "SELECT assumeNotNull(ts_max) AS time, sensor_id, dateDiff('second', assumeNotNull(ts_max), ingested_at) AS value FROM telescope.pcap_ingest_log WHERE status = 'ingested' AND ts_max IS NOT NULL AND $__timeFilter(ts_max) ORDER BY time" } ]
+    },
+    {
+      "id": 15, "type": "table", "title": "Last files",
+      "gridPos": { "x": 0, "y": 42, "w": 24, "h": 10 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+      "fieldConfig": { "defaults": { "custom": { "align": "auto", "filterable": true } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "size" }, "properties": [ { "id": "unit", "value": "bytes" } ] },
+          { "matcher": { "id": "byName", "options": "packets" }, "properties": [ { "id": "unit", "value": "short" } ] }
+        ] },
+      "options": { "showHeader": true, "cellHeight": "sm" },
+      "targets": [ { "refId": "A", "editorType": "sql", "queryType": "table", "format": 1,
+        "rawSql": "SELECT ingested_at AS ingested, sensor_id AS sensor, file_name AS file, status, inserted AS packets, file_size AS size, malformed, out_of_scope AS \"outside the darknet\", message FROM telescope.pcap_ingest_log ORDER BY ingested_at DESC LIMIT 50" } ]
+    }
+  ]
+}

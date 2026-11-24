@@ -1,0 +1,169 @@
+{
+  "uid": "nt-traffic",
+  "title": "Network Telescope - Traffic",
+  "tags": ["network-telescope"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5m",
+  "time": { "from": "now-24h", "to": "now" },
+  "graphTooltip": 1,
+  "editable": true,
+  "links": [
+    { "type": "dashboards", "title": "Dashboards", "tags": ["network-telescope"], "asDropdown": false, "keepTime": true }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "sensor", "label": "Sensor", "type": "query", "multi": true, "includeAll": true, "refresh": 2, "sort": 1,
+        "current": { "text": ["All"], "value": ["$__all"] },
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+        "query": "SELECT DISTINCT sensor_id FROM telescope.pcap_ingest_log ORDER BY sensor_id",
+        "definition": "SELECT DISTINCT sensor_id FROM telescope.pcap_ingest_log ORDER BY sensor_id"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "Packets", "description": "All TCP packets sent to the telescope in the selected time",
+      "gridPos": { "x": 0, "y": 0, "w": 5, "h": 4 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "text" } }, "overrides": [] },
+      "options": { "graphMode": "none", "colorMode": "value", "reduceOptions": { "calcs": ["lastNotNull"], "values": false } },
+      "targets": [ { "refId": "A", "editorType": "sql", "queryType": "table", "format": 1,
+        "rawSql": "SELECT count() AS packets FROM telescope.packets WHERE $__timeFilter(ts) AND sensor_id IN (${sensor:singlequote})" } ]
+    },
+    {
+      "id": 2, "type": "stat", "title": "Connection attempts (SYN)", "description": "SYN without ACK: what a passive telescope sees",
+      "gridPos": { "x": 5, "y": 0, "w": 5, "h": 4 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "text" } }, "overrides": [] },
+      "options": { "graphMode": "none", "colorMode": "value", "reduceOptions": { "calcs": ["lastNotNull"], "values": false } },
+      "targets": [ { "refId": "A", "editorType": "sql", "queryType": "table", "format": 1,
+        "rawSql": "SELECT countIf(bitAnd(flags, 18) = 2) AS syns FROM telescope.packets WHERE $__timeFilter(ts) AND sensor_id IN (${sensor:singlequote})" } ]
+    },
+    {
+      "id": 3, "type": "stat", "title": "Source addresses",
+      "gridPos": { "x": 10, "y": 0, "w": 5, "h": 4 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "text" } }, "overrides": [] },
+      "options": { "graphMode": "none", "colorMode": "value", "reduceOptions": { "calcs": ["lastNotNull"], "values": false } },
+      "targets": [ { "refId": "A", "editorType": "sql", "queryType": "table", "format": 1,
+        "rawSql": "SELECT uniq(src_ip) AS sources FROM telescope.packets WHERE $__timeFilter(ts) AND sensor_id IN (${sensor:singlequote})" } ]
+    },
+    {
+      "id": 4, "type": "stat", "title": "Destination ports",
+      "gridPos": { "x": 15, "y": 0, "w": 4, "h": 4 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "text" } }, "overrides": [] },
+      "options": { "graphMode": "none", "colorMode": "value", "reduceOptions": { "calcs": ["lastNotNull"], "values": false } },
+      "targets": [ { "refId": "A", "editorType": "sql", "queryType": "table", "format": 1,
+        "rawSql": "SELECT uniq(dst_port) AS ports FROM telescope.packets WHERE $__timeFilter(ts) AND sensor_id IN (${sensor:singlequote})" } ]
+    },
+    {
+      "id": 5, "type": "stat", "title": "Newest packet", "description": "The files arrive once per rotation (1 h), so up to 1-2 h is normal",
+      "gridPos": { "x": 19, "y": 0, "w": 5, "h": 4 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+      "fieldConfig": { "defaults": { "unit": "dateTimeFromNow", "color": { "mode": "fixed", "fixedColor": "text" } }, "overrides": [] },
+      "options": { "graphMode": "none", "colorMode": "value", "reduceOptions": { "calcs": ["lastNotNull"], "values": false, "fields": "/.*/" } },
+      "targets": [ { "refId": "A", "editorType": "sql", "queryType": "table", "format": 1,
+        "rawSql": "SELECT toUnixTimestamp(max(ts_max)) * 1000 AS newest FROM telescope.pcap_ingest_log WHERE status = 'ingested' AND sensor_id IN (${sensor:singlequote}) HAVING count() > 0" } ]
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "Packets per second, by sensor",
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 }, "interval": "5m",
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "displayName": "${__field.labels.sensor_id}", "color": { "mode": "palette-classic-by-name" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10, "showPoints": "never", "spanNulls": false } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "refId": "A", "editorType": "sql", "queryType": "timeseries", "format": 0,
+        "rawSql": "SELECT time, sensor_id, packets FROM (SELECT $__timeInterval(ts) AS time, sensor_id, count() / $__interval_s AS packets FROM telescope.packets WHERE $__timeFilter(ts) AND sensor_id IN (${sensor:singlequote}) GROUP BY time, sensor_id ORDER BY sensor_id, time WITH FILL STEP $__interval_s) ORDER BY time" } ]
+    },
+    {
+      "id": 7, "type": "timeseries", "title": "Packets per second, by kind", "description": "SYN: connection attempts. Data: packets with a payload. SYN-ACK: backscatter. The rest without payload: ACK, RST, FIN and other",
+      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 }, "interval": "5m",
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 10, "showPoints": "never", "spanNulls": false } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "SYN" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#3987e5" } } ] },
+          { "matcher": { "id": "byName", "options": "ACK" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#d95926" } } ] },
+          { "matcher": { "id": "byName", "options": "Data" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#199e70" } } ] },
+          { "matcher": { "id": "byName", "options": "RST" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#c98500" } } ] },
+          { "matcher": { "id": "byName", "options": "SYN-ACK" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#d55181" } } ] },
+          { "matcher": { "id": "byName", "options": "Other" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#898781" } } ] }
+        ] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "refId": "A", "editorType": "sql", "queryType": "timeseries", "format": 0,
+        "rawSql": "WITH multiIf(bitAnd(flags, 18) = 2, 'syn', bitAnd(flags, 18) = 18, 'synack', bitAnd(flags, 4) = 4, 'rst', payload_len > 0, 'data', bitAnd(flags, 17) = 16, 'ack', 'other') AS kind SELECT $__timeInterval(ts) AS time, countIf(kind = 'syn') / $__interval_s AS \"SYN\", countIf(kind = 'ack') / $__interval_s AS \"ACK\", countIf(kind = 'data') / $__interval_s AS \"Data\", countIf(kind = 'rst') / $__interval_s AS \"RST\", countIf(kind = 'synack') / $__interval_s AS \"SYN-ACK\", countIf(kind = 'other') / $__interval_s AS \"Other\" FROM telescope.packets WHERE $__timeFilter(ts) AND sensor_id IN (${sensor:singlequote}) GROUP BY time ORDER BY time WITH FILL STEP $__interval_s" } ]
+    },
+    {
+      "id": 8, "type": "timeseries", "title": "Connection attempts per address and hour, by branch", "description": "SYN without ACK, divided by the number of addresses in the branch (without the special and the management addresses). Current branch assignment",
+      "gridPos": { "x": 0, "y": 12, "w": 12, "h": 8 }, "interval": "1h",
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 0, "showPoints": "never", "spanNulls": false } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "passive" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#3987e5" } } ] },
+          { "matcher": { "id": "byName", "options": "r-irregular" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#d95926" } } ] },
+          { "matcher": { "id": "byName", "options": "r-regular" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#199e70" } } ] }
+        ] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "refId": "A", "editorType": "sql", "queryType": "timeseries", "format": 0,
+        "rawSql": "WITH cur AS (SELECT sensor_id, ip, branch FROM mgmt.ip_branches WHERE flag = '' AND sensor_id IN (${sensor:singlequote}) AND (sensor_id, valid_from) IN (SELECT sensor_id, max(valid_from) FROM mgmt.ip_branches GROUP BY sensor_id)) SELECT $__timeInterval(p.ts) AS time, 3600 / $__interval_s * countIf(c.branch = 'passive') / nullIf((SELECT countIf(branch = 'passive') FROM cur), 0) AS \"passive\", 3600 / $__interval_s * countIf(c.branch = 'r-irregular') / nullIf((SELECT countIf(branch = 'r-irregular') FROM cur), 0) AS \"r-irregular\", 3600 / $__interval_s * countIf(c.branch = 'r-regular') / nullIf((SELECT countIf(branch = 'r-regular') FROM cur), 0) AS \"r-regular\" FROM telescope.packets AS p INNER JOIN cur AS c ON p.sensor_id = c.sensor_id AND p.dst_ip = c.ip WHERE $__timeFilter(p.ts) AND bitAnd(p.flags, 18) = 2 GROUP BY time ORDER BY time WITH FILL STEP $__interval_s" } ]
+    },
+    {
+      "id": 9, "type": "timeseries", "title": "Other packets per address and hour, by branch", "description": "Everything but connection attempts (handshake ACK, data, RST ...), divided by the number of addresses in the branch. Grows on the answered branches once the responder runs",
+      "gridPos": { "x": 12, "y": 12, "w": 12, "h": 8 }, "interval": "1h",
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 0, "showPoints": "never", "spanNulls": false } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "passive" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#3987e5" } } ] },
+          { "matcher": { "id": "byName", "options": "r-irregular" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#d95926" } } ] },
+          { "matcher": { "id": "byName", "options": "r-regular" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#199e70" } } ] }
+        ] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "refId": "A", "editorType": "sql", "queryType": "timeseries", "format": 0,
+        "rawSql": "WITH cur AS (SELECT sensor_id, ip, branch FROM mgmt.ip_branches WHERE flag = '' AND sensor_id IN (${sensor:singlequote}) AND (sensor_id, valid_from) IN (SELECT sensor_id, max(valid_from) FROM mgmt.ip_branches GROUP BY sensor_id)) SELECT $__timeInterval(p.ts) AS time, 3600 / $__interval_s * countIf(c.branch = 'passive') / nullIf((SELECT countIf(branch = 'passive') FROM cur), 0) AS \"passive\", 3600 / $__interval_s * countIf(c.branch = 'r-irregular') / nullIf((SELECT countIf(branch = 'r-irregular') FROM cur), 0) AS \"r-irregular\", 3600 / $__interval_s * countIf(c.branch = 'r-regular') / nullIf((SELECT countIf(branch = 'r-regular') FROM cur), 0) AS \"r-regular\" FROM telescope.packets AS p INNER JOIN cur AS c ON p.sensor_id = c.sensor_id AND p.dst_ip = c.ip WHERE $__timeFilter(p.ts) AND bitAnd(p.flags, 18) != 2 GROUP BY time ORDER BY time WITH FILL STEP $__interval_s" } ]
+    },
+    {
+      "id": 10, "type": "bargauge", "title": "Top destination ports (SYN)",
+      "gridPos": { "x": 0, "y": 20, "w": 8, "h": 12 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "color": { "mode": "fixed", "fixedColor": "#3987e5" } }, "overrides": [] },
+      "options": { "orientation": "horizontal", "displayMode": "basic", "showUnfilled": false, "valueMode": "text", "sizing": "manual", "text": { "titleSize": 12, "valueSize": 14 }, "minVizHeight": 14, "maxVizHeight": 22, "reduceOptions": { "values": true, "calcs": [], "limit": 15, "fields": "/^packets$/" } },
+      "targets": [ { "refId": "A", "editorType": "sql", "queryType": "table", "format": 1,
+        "rawSql": "SELECT concat('tcp/', toString(dst_port)) AS port, count() AS packets FROM telescope.packets WHERE $__timeFilter(ts) AND bitAnd(flags, 18) = 2 AND sensor_id IN (${sensor:singlequote}) GROUP BY dst_port ORDER BY packets DESC LIMIT 15" } ]
+    },
+    {
+      "id": 11, "type": "bargauge", "title": "Top source countries (SYN)",
+      "gridPos": { "x": 8, "y": 20, "w": 8, "h": 12 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "color": { "mode": "fixed", "fixedColor": "#3987e5" } }, "overrides": [] },
+      "options": { "orientation": "horizontal", "displayMode": "basic", "showUnfilled": false, "valueMode": "text", "sizing": "manual", "text": { "titleSize": 12, "valueSize": 14 }, "minVizHeight": 14, "maxVizHeight": 22, "reduceOptions": { "values": true, "calcs": [], "limit": 15, "fields": "/^packets$/" } },
+      "targets": [ { "refId": "A", "editorType": "sql", "queryType": "table", "format": 1,
+        "rawSql": "SELECT if(e.country_name = '', 'unknown', e.country_name) AS country, sum(p.n) AS packets FROM (SELECT src_ip, count() AS n FROM telescope.packets WHERE $__timeFilter(ts) AND bitAnd(flags, 18) = 2 AND sensor_id IN (${sensor:singlequote}) GROUP BY src_ip) AS p LEFT ANY JOIN telescope.source_enrichment AS e ON p.src_ip = e.ip GROUP BY country ORDER BY packets DESC LIMIT 15" } ]
+    },
+    {
+      "id": 12, "type": "bargauge", "title": "Top source networks (SYN)",
+      "gridPos": { "x": 16, "y": 20, "w": 8, "h": 12 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "color": { "mode": "fixed", "fixedColor": "#3987e5" } }, "overrides": [] },
+      "options": { "orientation": "horizontal", "displayMode": "basic", "showUnfilled": false, "valueMode": "text", "sizing": "manual", "text": { "titleSize": 12, "valueSize": 14 }, "minVizHeight": 14, "maxVizHeight": 22, "reduceOptions": { "values": true, "calcs": [], "limit": 15, "fields": "/^packets$/" } },
+      "targets": [ { "refId": "A", "editorType": "sql", "queryType": "table", "format": 1,
+        "rawSql": "SELECT if(e.asn = 0, 'unknown', concat('AS', toString(e.asn), ' ', e.asn_name)) AS network, sum(p.n) AS packets FROM (SELECT src_ip, count() AS n FROM telescope.packets WHERE $__timeFilter(ts) AND bitAnd(flags, 18) = 2 AND sensor_id IN (${sensor:singlequote}) GROUP BY src_ip) AS p LEFT ANY JOIN telescope.source_enrichment AS e ON p.src_ip = e.ip GROUP BY network ORDER BY packets DESC LIMIT 15" } ]
+    },
+    {
+      "id": 13, "type": "table", "title": "Top source addresses",
+      "gridPos": { "x": 0, "y": 32, "w": 24, "h": 11 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-telescope" },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "align": "auto", "filterable": true } },
+        "overrides": [ { "matcher": { "id": "byRegexp", "options": "/seen/" }, "properties": [ { "id": "unit", "value": "dateTimeAsIso" } ] } ] },
+      "options": { "showHeader": true, "cellHeight": "sm" },
+      "targets": [ { "refId": "A", "editorType": "sql", "queryType": "table", "format": 1,
+        "rawSql": "SELECT toString(p.src_ip) AS source, p.packets AS packets, p.addresses AS \"telescope addresses\", p.ports AS ports, p.with_payload AS \"with payload\", e.country_name AS country, if(e.asn = 0, '', concat('AS', toString(e.asn), ' ', e.asn_name)) AS network, p.first_seen AS \"first seen\", p.last_seen AS \"last seen\" FROM (SELECT src_ip, count() AS packets, uniq(dst_ip) AS addresses, uniq(dst_port) AS ports, countIf(payload_len > 0) AS with_payload, min(ts) AS first_seen, max(ts) AS last_seen FROM telescope.packets WHERE $__timeFilter(ts) AND sensor_id IN (${sensor:singlequote}) GROUP BY src_ip ORDER BY packets DESC LIMIT 50) AS p LEFT ANY JOIN telescope.source_enrichment AS e ON p.src_ip = e.ip ORDER BY packets DESC" } ]
+    }
+  ]
+}

@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env")
 
 from prometheus_client import start_http_server as _start_metrics_server
+from src.health import alerts
 from src.parser.pcap_parser import ParseStats, PcapParser, PcapParseError
 from src.enricher.metadata_enricher import MetadataEnricher
 from src.lifecycle.data_lifecycle_manager import (
@@ -56,6 +57,13 @@ def sensor_of(filepath: Path) -> str | None:
     return None
 
 
+def check_volume(filepath: Path, sensor_id: str, stats: ParseStats, inserted: int, lifecycle: DataLifecycleManager) -> None:
+    try:
+        lifecycle.check_volume(filepath, sensor_id, stats, inserted)
+    except Exception as e:
+        logger.warning(f"Could not compare the traffic volume of {filepath.name}: {e}")
+
+
 def process_pcap_file(
     filepath: Path,
     sensor_id: str,
@@ -88,7 +96,6 @@ def process_pcap_file(
         lifecycle.remove_partial_rows(sensor_id, filepath.name)
         stats = ParseStats()
         inserted = 0
-        started = time.monotonic()
         try:
             for chunk in parser.parse_chunks(filepath, stats, INSERT_BATCH_SIZE, darknet):
                 new_sources = lifecycle.unknown_sources({p.src_ip for p in chunk})
@@ -102,11 +109,12 @@ def process_pcap_file(
         if not inserted:
             logger.info(f"No packets for the darknet in {sensor_id}/{filepath.name} ({stats.frames} frames), archiving.")
             lifecycle.log_file(filepath, sensor_id, sha256, "empty", stats)
+            check_volume(filepath, sensor_id, stats, 0, lifecycle)
             lifecycle.archive_pcap(filepath, sensor_id)
             return False
 
         lifecycle.log_file(filepath, sensor_id, sha256, "ingested", stats, inserted)
-        lifecycle.check_ingestion_speed(inserted, time.monotonic() - started)
+        check_volume(filepath, sensor_id, stats, inserted, lifecycle)
         lifecycle.archive_pcap(filepath, sensor_id)
         logger.info(
             f"Done: {sensor_id}/{filepath.name} - {inserted} packets ingested "
@@ -142,8 +150,8 @@ def process_branch_manifest(filepath: Path, lifecycle: DataLifecycleManager, reg
 
         if changed:
             split = ", ".join(f"{n} {branch}" for branch, n in manifest.counts().items())
-            lifecycle.alert(
-                f"[Network Telescope] {sensor_id}: NEW BRANCH ASSIGNMENT in force from {written_at:%Y-%m-%d %H:%M:%S} UTC: "
+            alerts.send(
+                f"{sensor_id}: NEW BRANCH ASSIGNMENT in force from {written_at:%Y-%m-%d %H:%M:%S} UTC: "
                 f"{split} (seed {manifest.seed or '-'}, {filepath.name})"
             )
         lifecycle.archive_pcap(filepath, sensor_id)

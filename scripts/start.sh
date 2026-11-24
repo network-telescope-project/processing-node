@@ -9,7 +9,6 @@ PROJECT_ROOT=$(dirname "$SCRIPT_DIR")
 NT_USER="telescope"
 NT_GROUP="telescope"
 
-DATA_DIR="${PCAP_INBOX_DIR:-/var/lib/network-telescope/data/queue}"
 CONF_DIR="/etc/network-telescope"
 VENV_DIR="${PROJECT_ROOT}/.venv"
 ENV_FILE="${PROJECT_ROOT}/.env"
@@ -40,6 +39,14 @@ check_or_start_service() {
         warn "${svc} is not running - starting..."
         systemctl start "${svc}" && ok "${svc} started" || { err "Could not start ${svc}"; ERRORS=$(( ERRORS + 1 )); }
     fi
+    if ! systemctl is-enabled --quiet "${svc}" 2>/dev/null; then
+        err "${svc} is not enabled (would not come back after a reboot): systemctl enable ${svc}"
+        ERRORS=$(( ERRORS + 1 ))
+    fi
+}
+
+ch_query() {        # ch_query <user> <password> <query>
+    curl -sf --max-time 10 "http://${CH_HOST}:${CH_PORT}/" -H "X-ClickHouse-User: $1" -H "X-ClickHouse-Key: $2" --data-binary "$3" 2>/dev/null
 }
 
 # --env file------------------------------------------------------------------
@@ -54,6 +61,17 @@ else
     ERRORS=$(( ERRORS + 1 ))
 fi
 
+INBOX_DIR="${PCAP_INBOX_DIR:-/var/lib/network-telescope/data/queue}"
+ARCHIVE_DIR="${PCAP_ARCHIVE_DIR:-/var/lib/network-telescope/data/archive}"
+QUARANTINE_DIR="${PCAP_QUARANTINE_DIR:-/var/lib/network-telescope/data/quarantine}"
+
+# --Clock---------------------------------------------------------------------
+if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == "yes" ]]; then
+    ok "Clock synchronised: $(date -u '+%Y-%m-%d %H:%M:%S') UTC"
+else
+    warn "Clock is not synchronised by NTP and will slowly drift: $(date -u '+%Y-%m-%d %H:%M:%S') UTC (setup.sh sets it once)"
+fi
+
 # --Python venv---------------------------------------------------------------
 if [[ -x "${VENV_DIR}/bin/python" ]]; then
     ok "Python venv OK: $(${VENV_DIR}/bin/python --version)"
@@ -65,8 +83,13 @@ fi
 # --Docker--------------------------------------------------------------------
 if command -v docker &>/dev/null && docker info &>/dev/null; then
     ok "Docker running"
+    if ! systemctl is-enabled --quiet docker 2>/dev/null; then
+        err "Docker is not enabled: the containers would not come back after a reboot (systemctl enable docker)"
+        ERRORS=$(( ERRORS + 1 ))
+    fi
 else
     err "Docker not running or not installed"
+    ERRORS=$(( ERRORS + 1 ))
 fi
 
 # prometheus.yml
@@ -89,20 +112,21 @@ fi
 
 # --Docker compose------------------------------------------------------------
 log "Starting Docker Compose stack..."
-docker compose -f "${COMPOSE_FILE}" --env-file "${ENV_FILE}" up -d
-ok "Docker Compose stack started."
-#[[ -f "${COMPOSE_FILE}" ]] || COMPOSE_FILE="${PROJECT_ROOT}/docker/docker-compose.local.yml"
-#
-#for svc in clickhouse prometheus grafana; do
-#    if docker compose -f "${COMPOSE_FILE}" --env-file "${ENV_FILE}" \
-#        ps --status running "${svc}" 2>/dev/null | grep -q "${svc}"; then
-#        ok "Container ${svc} running"
-#    else
-#        warn "Container ${svc} not running - starting..."
-#        docker compose -f "${COMPOSE_FILE}" --env-file "${ENV_FILE}" up -d "${svc}" \
-#            && ok "${svc} started" || err "Could not start ${svc}"
-#    fi
-#done
+if docker compose -f "${COMPOSE_FILE}" --env-file "${ENV_FILE}" up -d; then
+    ok "Docker Compose stack started."
+else
+    err "docker compose up failed"
+    ERRORS=$(( ERRORS + 1 ))
+fi
+
+for container in nt_clickhouse nt_prometheus nt_grafana nt-geoipupdate; do
+    STATE=$(docker inspect -f '{{.State.Status}}{{if .State.Health}} {{.State.Health.Status}}{{end}}' "${container}" 2>/dev/null) || STATE="missing"
+    case "${STATE}" in
+        "running"|"running healthy") ok "Container ${container}: ${STATE}" ;;
+        "running starting")          warn "Container ${container}: ${STATE}" ;;
+        *)                           err "Container ${container}: ${STATE} (docker logs ${container})"; ERRORS=$(( ERRORS + 1 )) ;;
+    esac
+done
 
 # --Clickhouse----------------------------------------------------------------
 CH_HOST="${CLICKHOUSE_HOST:-localhost}"
@@ -113,8 +137,7 @@ CH_DB="${CLICKHOUSE_DB:-telescope}"
 
 log "Waiting for ClickHouse on ${CH_HOST}:${CH_PORT}..."
 for i in $(seq 1 30); do
-    if curl -sf "http://${CH_HOST}:${CH_PORT}/?user=${CH_USER}&password=${CH_PASS}&query=SELECT+1" \
-        | grep -q "^1$"; then
+    if [[ "$(ch_query "${CH_USER}" "${CH_PASS}" "SELECT 1")" == "1" ]]; then
         ok "ClickHouse ready."
         break
     fi
@@ -126,30 +149,72 @@ for i in $(seq 1 30); do
 done
 
 # Check schema
-TABLES=$(curl -sf \
-    "http://${CH_HOST}:${CH_PORT}/?user=${CH_USER}&password=${CH_PASS}&database=${CH_DB}&query=SHOW+TABLES" \
-    2>/dev/null || echo "")
-if echo "${TABLES}" | grep -q "packets"; then
-    ok "ClickHouse schema OK (packets table present)."
+TABLES=" $(ch_query "${CH_USER}" "${CH_PASS}" "SELECT concat(database, '.', name) FROM system.tables WHERE database IN ('${CH_DB}', 'mgmt')" | tr '\n' ' ') " || true
+MISSING=""
+for table in "${CH_DB}.packets" "${CH_DB}.source_enrichment" "${CH_DB}.pcap_ingest_log" "${CH_DB}.telescope_health" \
+             mgmt.sensors mgmt.sensor_prefixes mgmt.ip_branches; do
+    [[ "${TABLES}" == *" ${table} "* ]] || MISSING+=" ${table}"
+done
+if [[ -z "${MISSING}" ]]; then
+    ok "ClickHouse schema OK."
 else
-    err "packets table missing - ClickHouse schema not initialised."
+    err "ClickHouse tables missing:${MISSING}"
+    ERRORS=$(( ERRORS + 1 ))
+fi
+if ch_query nt_reader "${CLICKHOUSE_RO_PASSWORD:-}" "SELECT count() FROM mgmt.sensors" > /dev/null; then
+    ok "Read-only user nt_reader (Grafana) can read."
+else
+    err "Read-only user nt_reader cannot read (CLICKHOUSE_RO_PASSWORD changed? - recreate the clickhouse container)"
     ERRORS=$(( ERRORS + 1 ))
 fi
 
-# --Data directory------------------------------------------------------------
-if [[ -d "${DATA_DIR}" ]]; then
-    ok "PCAP inbox exists: ${DATA_DIR}"
-    PENDING=$(find "${DATA_DIR}" -name "*.pcap" 2>/dev/null | wc -l)
-    [[ ${PENDING} -gt 0 ]] && warn "  ${PENDING} .pcap file(s) waiting to be processed"
-else
-    err "PCAP inbox missing: ${DATA_DIR}"
-    ERRORS=$(( ERRORS + 1 ))
+# --Data directories----------------------------------------------------------
+for dir in "${INBOX_DIR}" "${ARCHIVE_DIR}" "${QUARANTINE_DIR}"; do
+    if [[ ! -d "${dir}" ]]; then
+        err "Directory missing: ${dir} - run setup.sh"
+        ERRORS=$(( ERRORS + 1 ))
+    elif ! runuser -u "${NT_USER}" -- test -w "${dir}"; then
+        err "${dir} is not writable by ${NT_USER}"
+        ERRORS=$(( ERRORS + 1 ))
+    else
+        ok "Directory OK: ${dir}"
+    fi
+done
+PENDING=$(find "${INBOX_DIR}" -name "*.pcap" 2>/dev/null | wc -l) || true
+[[ ${PENDING} -eq 0 ]] || warn "${PENDING} PCAP file(s) waiting to be processed"
+QUARANTINED=$(find "${QUARANTINE_DIR}" -type f ! -name "*.error.txt" 2>/dev/null | wc -l) || true
+[[ ${QUARANTINED} -eq 0 ]] || warn "${QUARANTINED} file(s) in quarantine (could not be read): ${QUARANTINE_DIR}"
+
+if [[ -d "${ARCHIVE_DIR}" ]]; then
+    FREE_GB=$(( $(df -Pk "${ARCHIVE_DIR}" | awk 'NR==2 {print $4}') / 1024 / 1024 ))
+    if [[ ${FREE_GB} -lt ${ARCHIVE_MIN_FREE_GB:-20} ]]; then
+        err "Low disk space: ${FREE_GB} GB free, below ARCHIVE_MIN_FREE_GB=${ARCHIVE_MIN_FREE_GB:-20}: the oldest archive files are being deleted"
+        ERRORS=$(( ERRORS + 1 ))
+    else
+        ok "Disk space OK: ${FREE_GB} GB free"
+    fi
 fi
 
-QUARANTINE_DIR="${PCAP_QUARANTINE_DIR:-/var/lib/network-telescope/data/quarantine}"
-if [[ -d "${QUARANTINE_DIR}" ]]; then
-    QUARANTINED=$(find "${QUARANTINE_DIR}" -name "*.pcap" 2>/dev/null | wc -l)
-    [[ ${QUARANTINED} -gt 0 ]] && warn "${QUARANTINED} PCAP file(s) in quarantine (failed to parse): ${QUARANTINE_DIR}"
+# TODO change when we'll use a different enriching sources
+# --GeoIP databases-----------------------------------------------------------
+for edition in GeoLite2-City GeoLite2-ASN; do
+    MMDB="${DOCKER_DIR}/geoip/${edition}.mmdb"
+    if [[ ! -f "${MMDB}" ]]; then
+        err "${edition} missing: check the MaxMind account in ${ENV_FILE} (docker logs nt-geoipupdate)"
+        ERRORS=$(( ERRORS + 1 ))
+    elif [[ -n "$(find "${MMDB}" -mtime +30)" ]]; then
+        warn "${edition} is older than 30 days: it is not being updated (docker logs nt-geoipupdate)"
+    else
+        ok "${edition} present"
+    fi
+done
+
+# --Transfer port-------------------------------------------------------------
+if [[ -n "$(ss -ltnH "sport = :${SSH_INGEST_PORT:-8500}")" ]]; then
+    ok "sshd listens on the transfer port ${SSH_INGEST_PORT:-8500}"
+else
+    err "Nothing listens on the transfer port ${SSH_INGEST_PORT:-8500} - run setup.sh"
+    ERRORS=$(( ERRORS + 1 ))
 fi
 
 # --WireGuard tunnel of the capturing nodes-----------------------------------
@@ -188,6 +253,36 @@ fi
 # --Systemd service-----------------------------------------------------------
 echo ""
 check_or_start_service nt-processing
+check_or_start_service prometheus-node-exporter
+
+METRICS_OK=0
+for _ in $(seq 1 10); do
+    [[ "$(curl -s --max-time 5 "http://127.0.0.1:${METRICS_PORT:-8000}/metrics")" == *telescope_held_files* ]] && { METRICS_OK=1; break; }
+    sleep 1
+done
+if [[ ${METRICS_OK} -eq 1 ]]; then
+    ok "nt-processing answers on its metrics port ${METRICS_PORT:-8000}"
+else
+    err "nt-processing does not answer on its metrics port ${METRICS_PORT:-8000} (journalctl -u nt-processing)"
+    ERRORS=$(( ERRORS + 1 ))
+fi
+
+# --What Prometheus reaches----------------------------------------------------
+if TARGETS=$(curl -sf --max-time 10 "http://127.0.0.1:9090/api/v1/targets?state=active" \
+             | jq -r '.data.activeTargets[] | "\(.health) \(.labels.job) \(.labels.sensor // "-")"' 2>/dev/null); then
+    while read -r health job sensor; do
+        [[ -n "${health}" ]] || continue
+        [[ "${sensor}" == "-" ]] || job="${job} ${sensor}"
+        case "${health}" in
+            up)      ok "Prometheus reaches ${job}" ;;
+            unknown) warn "Prometheus has not scraped ${job} yet" ;;
+            *)       err "Prometheus does not reach ${job}"; ERRORS=$(( ERRORS + 1 )) ;;
+        esac
+    done <<< "${TARGETS}"
+else
+    err "Prometheus does not answer"
+    ERRORS=$(( ERRORS + 1 ))
+fi
 
 # --Summary-------------------------------------------------------------------
 echo ""
