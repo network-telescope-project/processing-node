@@ -44,8 +44,7 @@ class IngestWatchdog:
         self._registry = registry
         self._prom = Prometheus()
         self._started = time.time()
-        self._conditions = alerts.Conditions()
-        self._reported_gaps: set[tuple[str, str, str]] = set()
+        self._conditions = alerts.Conditions("ingest")
 
     def _files(self) -> dict[str, list[tuple[Path, float]]]:
         """(path, mtime) of every PCAP in the inbox, archive and quarantine, by sensor."""
@@ -96,7 +95,8 @@ class IngestWatchdog:
                 + self._diagnosis(sensor, now)
             )
         self._conditions.update(
-            (sensor, "stale"), problem, f"{sensor}: PCAP files are arriving again (newest: {newest[0].name if newest else '-'})"
+            (sensor, "stale"), problem, f"{sensor}: PCAP files are arriving again (newest: {newest[0].name if newest else '-'})",
+            level=logging.ERROR,
         )
 
     def _diagnosis(self, sensor: str, now: float) -> str:
@@ -139,10 +139,8 @@ class IngestWatchdog:
             age = now - cur_mtime   # file modification time ~ capture time, independent of time zones
             if not GAP_GRACE_SECONDS <= age <= GAP_LOOKBACK_SECONDS:
                 continue
-            key = (sensor, prev_name, cur_name)
-            if key in self._reported_gaps:
+            if not alerts.once(("gap", sensor, prev_name.split(".")[0], cur_name.split(".")[0])):
                 continue
-            self._reported_gaps.add(key)
             new_gaps.append((first_missing, cur_seq - 1, prev_name, cur_name))
 
         if not new_gaps:
@@ -156,5 +154,6 @@ class IngestWatchdog:
         extra = f" (+{len(new_gaps) - MAX_GAPS_IN_MESSAGE} more)" if len(new_gaps) > MAX_GAPS_IN_MESSAGE else ""
         alerts.send(
             f"{sensor}: CAPTURE FILE(S) MISSING ({lost}): " + "; ".join(lines) + extra
-            + ". Lost on the capturing node (ring buffer overwrite, failed transfer) or removed by hand."
+            + ". Lost on the capturing node (ring buffer overwrite, failed transfer) or removed by hand.",
+            logging.ERROR,
         )

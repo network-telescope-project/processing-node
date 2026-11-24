@@ -362,6 +362,8 @@ WorkingDirectory=${PROJECT_ROOT}
 EnvironmentFile=${ENV_FILE}
 Environment=GEOIP_DB_DIR=${DOCKER_DIR}/geoip
 Environment=PROMETHEUS_TARGETS_FILE=${DOCKER_DIR}/prometheus/targets/capturing-nodes.json
+Environment=ALERT_STATE_FILE=/var/lib/nt-processing/alerts.json
+StateDirectory=nt-processing
 ExecStart=${VENV_DIR}/bin/python -m src.main
 Restart=always
 RestartSec=10

@@ -284,6 +284,12 @@ else
     ERRORS=$(( ERRORS + 1 ))
 fi
 
+# --Alerts--------------------------------------------------------------------
+[[ -n "${ALERT_WEBHOOK_URL:-}" ]] && ok "Alerts go to the Slack webhook" \
+    || warn "ALERT_WEBHOOK_URL is not set: alerts are only in the log (journalctl -u nt-processing)"
+[[ -n "${HEARTBEAT_URL:-}" ]] && ok "Heartbeat configured" \
+    || warn "HEARTBEAT_URL is not set: nobody notices when this machine itself is down"
+
 # --Summary-------------------------------------------------------------------
 echo ""
 if [[ ${ERRORS} -eq 0 ]]; then

@@ -42,6 +42,9 @@ POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "10"))
 READY_AGE_SECONDS = int(os.environ.get("READY_AGE_SECONDS", "5"))
 PROMETHEUS_TARGETS_FILE = os.environ.get("PROMETHEUS_TARGETS_FILE", "")
 
+conditions = alerts.Conditions("main")
+failed_files: list[str] = []
+
 
 def sensor_of(filepath: Path) -> str | None:
     """The sensor a file in the inbox came from: the sub-directory it was delivered to. A file directly in the inbox
@@ -123,6 +126,7 @@ def process_pcap_file(
         )
     except Exception as e:
         logger.exception(f"Failed to process {sensor_id}/{filepath.name}: {e}")
+        failed_files.append(f"{sensor_id}/{filepath.name}: {str(e)[:200]}")
     return False
 
 
@@ -152,12 +156,21 @@ def process_branch_manifest(filepath: Path, lifecycle: DataLifecycleManager, reg
             split = ", ".join(f"{n} {branch}" for branch, n in manifest.counts().items())
             alerts.send(
                 f"{sensor_id}: NEW BRANCH ASSIGNMENT in force from {written_at:%Y-%m-%d %H:%M:%S} UTC: "
-                f"{split} (seed {manifest.seed or '-'}, {filepath.name})"
+                f"{split} (seed {manifest.seed or '-'}, {filepath.name})",
+                logging.INFO,
             )
         lifecycle.archive_pcap(filepath, sensor_id)
     except Exception as e:
         logger.exception(f"Failed to process {sensor_id}/{filepath.name}: {e}")
+        failed_files.append(f"{sensor_id}/{filepath.name}: {str(e)[:200]}")
     return False
+
+
+def run_jobs() -> None:
+    try:
+        schedule.run_pending()
+    except Exception as e:
+        logger.exception(f"A scheduled job failed: {e}")
 
 
 def scan_inbox(
@@ -189,12 +202,14 @@ def scan_inbox(
             candidates.add(pcap)
 
     held = 0
+    failed_files.clear()
     # Branch assignments of the sensors, before their packets
     for manifest in sorted(PCAP_INBOX_DIR.glob("*/branches_*.tsv")):
         if SENSOR_ID.match(manifest.parent.name) and (now - manifest.stat().st_mtime) > READY_AGE_SECONDS:
             held += process_branch_manifest(manifest, lifecycle, registry)
 
     for filepath in sorted(candidates):
+        run_jobs()
         sensor_id = sensor_of(filepath)
         if sensor_id is None:
             lifecycle.report_held(str(filepath.parent), f"{filepath} is neither directly in the inbox nor in a sensor sub-directory")
@@ -202,6 +217,11 @@ def scan_inbox(
             continue
         held += process_pcap_file(filepath, sensor_id, parser, enricher, lifecycle, registry)
     HELD_FILES.set(held)
+    conditions.update(
+        ("ingest",),
+        f"INGEST FAILS for {len(failed_files)} file(s), they stay in the inbox: {failed_files[0]}" if failed_files else None,
+        "ingest works again", after=6, level=logging.ERROR,
+    )
 
     # Files are removed from quarantine by hand once looked at
     lifecycle.update_quarantine_gauge()
@@ -244,6 +264,7 @@ def main() -> None:
     schedule.every(5).minutes.do(health_mgr.run)
     schedule.every(5).minutes.do(watchdog.run)
     schedule.every(5).minutes.do(sync_prometheus_targets, registry)
+    schedule.every(5).minutes.do(alerts.heartbeat)
     schedule.every().hour.do(lifecycle.maintain_archive)
 
     # Graceful shutdown
@@ -260,11 +281,12 @@ def main() -> None:
     while not shutdown["requested"]:
         try:
             scan_inbox(parser, enricher, lifecycle, registry)
-            schedule.run_pending()
         except Exception as e:
             logger.exception(f"Unexpected error in main loop: {e}")
+        run_jobs()
         time.sleep(POLL_INTERVAL_SECONDS)
 
+    alerts.flush()
     logger.info("Processing node stopped.")
 
 

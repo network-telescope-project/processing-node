@@ -69,8 +69,7 @@ class HealthMonitoringManager:
         self._db = db_client
         self._registry = registry
         self._prom = Prometheus()
-        self._conditions = alerts.Conditions()
-        self._last_loss: dict[str, float] = {}      # per sensor: when a capture that lost packets last ended
+        self._conditions = alerts.Conditions("health")
 
     def run(self) -> None:
         logger.info("Running health check...")
@@ -79,12 +78,16 @@ class HealthMonitoringManager:
             ("prometheus",),
             None if reachable else "PROMETHEUS does not answer: the health of the nodes is unknown (docker ps; is nt_prometheus running?)",
             "Prometheus answers again",
-            after=2,
+            after=2, level=logging.ERROR,
         )
+        sensors, error = None, None
         try:
             sensors = self._registry.monitored_ids()
         except Exception as e:
             logger.error(f"Could not read the sensor registry, health check skipped: {e}")
+            error = "CLICKHOUSE does not answer: nothing is ingested (docker ps; is nt_clickhouse running?)"
+        self._conditions.update(("clickhouse",), error, "ClickHouse answers again", after=2, level=logging.ERROR)
+        if sensors is None:
             return
 
         capture_path = os.environ.get("CAPTURE_MOUNTPOINT", "/var/lib/network-telescope")
@@ -97,7 +100,7 @@ class HealthMonitoringManager:
             ]
             self._check_node(PROCESSING_NODE, 'job="processing-node"', paths, reachable, capturing=False)
 
-    # --- one machine -------------------------------------------------------------------------------------
+    # One machine
     def _collect(self, sel: str, paths: list[str], capturing: bool) -> dict[str, Any]:
         m: dict[str, Any] = dict.fromkeys([*HOST_METRICS, *CAPTURE_METRICS])
         # Down only if every scrape of the last minutes failed
@@ -145,8 +148,8 @@ class HealthMonitoringManager:
         name = "processing node" if node == PROCESSING_NODE else node
         problems: list[str] = []
 
-        def check(problem: str, is_on: bool, msg: str, resolved: str, after: int = 1) -> None:
-            if self._conditions.update((node, problem), f"{name}: {msg}" if is_on else None, f"{name}: {resolved}", after):
+        def check(problem: str, is_on: bool, msg: str, resolved: str, after: int = 1, level: int = logging.WARNING) -> None:
+            if self._conditions.update((node, problem), f"{name}: {msg}" if is_on else None, f"{name}: {resolved}", after, level):
                 problems.append(problem)
 
         if not reachable or (node == LOCAL_SENSOR_ID and m["exporter_up"] is None):
@@ -156,7 +159,7 @@ class HealthMonitoringManager:
             "exporter", m["exporter_up"] != 1.0,
             "UNREACHABLE: its node-exporter does not answer (node or tunnel down?)" if m["exporter_up"] == 0.0
             else "NOT MONITORED: Prometheus does not scrape its node-exporter",
-            "reachable again", after=1 if m["exporter_up"] == 0.0 else 4,
+            "reachable again", after=1 if m["exporter_up"] == 0.0 else 4, level=logging.ERROR,
         )
         if m["exporter_up"] != 1.0:
             return problems
@@ -165,7 +168,7 @@ class HealthMonitoringManager:
             mount, avail, size = m["fs"]
             pct = avail / size * 100
             text = f"{pct:.1f}% free ({avail / GB:.1f} of {size / GB:.1f} GB on {mount})"
-            check("disk", pct < DISK_LOW_THRESHOLD_PCT, f"DISK LOW: {text}, threshold {DISK_LOW_THRESHOLD_PCT:.0f}%", f"disk OK again: {text}")
+            check("disk", pct < DISK_LOW_THRESHOLD_PCT, f"DISK LOW: {text}, threshold {DISK_LOW_THRESHOLD_PCT:.0f}%", f"disk OK again: {text}", level=logging.ERROR)
         if m["clock_synced"] is not None:
             check("clock", m["clock_synced"] == 0, "CLOCK NOT SYNCHRONISED: it will drift", "clock synchronised again", after=3)
         if m["softnet_drop_pps"] is not None:
@@ -180,16 +183,16 @@ class HealthMonitoringManager:
         if not m["metrics_fresh"]:
             return problems
         if m["capture_running"] is not None:
-            check("capture", m["capture_running"] == 0, "CAPTURE NOT RUNNING: no dumpcap process", "capture is running again")
+            check("capture", m["capture_running"] == 0, "CAPTURE NOT RUNNING: no dumpcap process", "capture is running again", level=logging.ERROR)
         units = [u for u in m["down_units"] if u != "nt-capture.service"]      # that one is the check above
-        check("units", bool(units), f"SERVICES DOWN: {', '.join(units)}", "all services are running again", after=2)
+        check("units", bool(units), f"SERVICES DOWN: {', '.join(units)}", "all services are running again", after=2, level=logging.ERROR)
         if m["capture_cpu_pct"] is not None:
             check("capture_cpu", m["capture_cpu_pct"] > CAPTURE_CPU_ALERT_PCT, f"dumpcap uses {m['capture_cpu_pct']:.0f}% of a CPU core: it may be losing packets", "dumpcap CPU usage is normal again", after=2)
         if m["unsent_files"] is not None and m["ring_limit"]:
             check(
                 "unsent", m["unsent_files"] >= RING_ALERT_FRACTION * m["ring_limit"],
                 f"{m['unsent_files']:.0f} PCAP FILES NOT TRANSFERRED (oldest {(m['unsent_oldest_s'] or 0) / 3600:.1f} h): beyond {m['ring_limit']:.0f} files the node deletes the oldest",
-                "the transfer has caught up",
+                "the transfer has caught up", level=logging.ERROR,
             )
         self._report_drops(node, m)
         return problems
@@ -197,12 +200,9 @@ class HealthMonitoringManager:
     def _report_drops(self, node: str, m: dict[str, Any]) -> None:
         """dumpcap says how many packets it lost when it stops"""
         ended = m.get("last_loss")
-        if ended is None:
-            return
-        known = self._last_loss.get(node)
-        self._last_loss[node] = ended
-        if known is not None and ended > known and m["capture_last_loss"]:
+        if ended and m["capture_last_loss"] and alerts.once(("loss", node, int(ended))):
             alerts.send(
                 f"{node}: dumpcap LOST {m['capture_last_loss']:.0f} PACKETS in the capture that ended at "
-                f"{datetime.fromtimestamp(ended, timezone.utc):%Y-%m-%d %H:%M} UTC"
+                f"{datetime.fromtimestamp(ended, timezone.utc):%Y-%m-%d %H:%M} UTC",
+                logging.ERROR,
             )

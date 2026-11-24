@@ -114,8 +114,7 @@ def file_sha256(path: Path) -> str:
 class DataLifecycleManager:
     def __init__(self, db_client):
         self._db = db_client
-        self._held_reported: set[tuple[str, str]] = set()
-        self._conditions = alerts.Conditions()
+        self._conditions = alerts.Conditions("lifecycle")
         self._archive_dir = PCAP_ARCHIVE_DIR
         self._quarantine_dir = PCAP_QUARANTINE_DIR
 
@@ -143,10 +142,9 @@ class DataLifecycleManager:
             )
 
     def report_held(self, sensor_id: str, reason: str) -> None:
-        """A file stays in the inbox because its sensor cannot be ingested; said once per reason, not every scan"""
-        if (sensor_id, reason) in self._held_reported:
+        """A file stays in the inbox because its sensor cannot be ingested; said once a day per reason, not every scan"""
+        if not alerts.once(("held", sensor_id, reason), every=86400):
             return
-        self._held_reported.add((sensor_id, reason))
         alerts.send(f"FILES HELD in the inbox: {reason}. Register it with `python -m src.registry`; they are ingested once it is ready.")
 
     def log_file(
@@ -342,7 +340,7 @@ class DataLifecycleManager:
         for reason, n in pruned.items():
             if n:
                 logger.info(f"Archive retention: deleted {n} oldest file(s) ({reason})")
-        if pruned["size"] or pruned["free_space"]:
+        if (pruned["size"] or pruned["free_space"]) and alerts.once(("archive full",), every=86400):
             alerts.send(
                 f"ARCHIVE FULL: deleted {pruned['size'] + pruned['free_space']} "
                 f"file(s) before the {ARCHIVE_MAX_AGE_DAYS}-day limit "
@@ -354,6 +352,7 @@ class DataLifecycleManager:
                 f"DISK LOW: {free / GIB:.1f} GB free, below the {ARCHIVE_MIN_FREE_BYTES / GIB:.0f} GB limit, "
                 "with nothing left to prune in the archive" if free < ARCHIVE_MIN_FREE_BYTES else None,
                 f"disk OK again: {free / GIB:.1f} GB free",
+                level=logging.ERROR,
             )
 
         ARCHIVE_FILES.set(len(entries))
