@@ -3,11 +3,12 @@
     python -m src.registry list
     python -m src.registry add-sensor SENSOR_ID [--description TEXT] [--exporter HOST:PORT]
     python -m src.registry set-sensor SENSOR_ID [--description TEXT] [--exporter HOST:PORT] [--active | --inactive]
-    python -m src.registry add-prefix SENSOR_ID CIDR [CIDR ...] [--mode passive|reactive]
+    python -m src.registry add-prefix SENSOR_ID CIDR [CIDR ...]
     python -m src.registry remove-prefix SENSOR_ID CIDR [CIDR ...]
+    python -m src.registry branches [SENSOR_ID]
     python -m src.registry sync-targets
 
-A node delivers its PCAP files to <inbox>/<SENSOR_ID>/ (REMOTE_DIR on the capturing node). Files of a sensor that is not
+A node delivers its PCAP files to <inbox>/<SENSOR_ID>/ (its SSH key is locked to that directory by scripts/add-sensor.sh). Files of a sensor that is not
 registered, deactivated or without a prefix are held in the inbox, not ingested. Changes apply without a restart.
 """
 from __future__ import annotations
@@ -22,7 +23,7 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=Path(__file__).parent.parent.parent / ".env")
 
 from src.db import get_client
-from src.registry.sensor_registry import MODES, RegistryError, SensorRegistry
+from src.registry.sensor_registry import RegistryError, SensorRegistry
 
 
 def _list(reg: SensorRegistry, _args) -> None:
@@ -31,9 +32,19 @@ def _list(reg: SensorRegistry, _args) -> None:
         print("No sensors registered.")
     for s in sensors:
         print(f"{s.sensor_id}  [{'active' if s.active else 'INACTIVE'}]  exporter={s.exporter or '-'}  {s.description}")
-        for _, prefix, valid_from, valid_to, mode in reg.prefixes(s.sensor_id, open_only=False):
+        for _, prefix, valid_from, valid_to in reg.prefixes(s.sensor_id, open_only=False):
             span = f"since {valid_from:%Y-%m-%d %H:%M}" if valid_to is None else f"{valid_from:%Y-%m-%d %H:%M} .. {valid_to:%Y-%m-%d %H:%M}"
-            print(f"    {prefix:<20} {mode:<9} {span}")
+            print(f"    {prefix:<20} {span}")
+
+
+def _branches(reg: SensorRegistry, args) -> None:
+    """The branch assignments the nodes delivered (mgmt.ip_branches); the last one of a sensor is in force"""
+    known = reg.branch_assignments(args.sensor_id)
+    if not known:
+        print("No branch assignment delivered yet (a node sends it when its start.sh runs).")
+    for sensor, valid_from, manifest, seed, counts in known:
+        split = ", ".join(f"{n} {branch}" for branch, n in sorted(counts.items()))
+        print(f"{sensor}  since {valid_from:%Y-%m-%d %H:%M:%S}  {split}  seed={seed or '-'}  manifest={manifest[:12]}")
 
 
 def _sync(reg: SensorRegistry, _args) -> None:
@@ -66,13 +77,16 @@ def main(argv: list[str] | None = None) -> int:
     ap = sub.add_parser("add-prefix", help="start monitoring prefixes (IPv4 CIDR, a single address is /32)")
     ap.add_argument("sensor_id")
     ap.add_argument("prefixes", nargs="+")
-    ap.add_argument("--mode", choices=MODES, default="passive", help="reactive = a responder answers on these addresses")
-    ap.set_defaults(fn=lambda r, x: [print("added", r.add_prefix(x.sensor_id, c, x.mode)) for c in x.prefixes])
+    ap.set_defaults(fn=lambda r, x: [print("added", r.add_prefix(x.sensor_id, c)) for c in x.prefixes])
 
     rp = sub.add_parser("remove-prefix", help="stop monitoring prefixes (their history stays)")
     rp.add_argument("sensor_id")
     rp.add_argument("prefixes", nargs="+")
     rp.set_defaults(fn=lambda r, x: [print("removed", r.remove_prefix(x.sensor_id, c)) for c in x.prefixes])
+
+    b = sub.add_parser("branches", help="the branch assignments delivered by the nodes (passive / r-irregular / r-regular per address)")
+    b.add_argument("sensor_id", nargs="?", default=None)
+    b.set_defaults(fn=_branches)
 
     sub.add_parser("sync-targets", help="write the Prometheus target file now").set_defaults(fn=_sync)
 

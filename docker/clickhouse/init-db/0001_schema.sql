@@ -69,21 +69,29 @@ ORDER BY (file_sha256, ingested_at);
 
 
 -- Telescope Health table
--- TODO think about what high-level health data we might store
 CREATE TABLE IF NOT EXISTS telescope.telescope_health
 (
-    ts DateTime('UTC'),
-    sensor_id LowCardinality(String),   -- capture node ID
-    ingestion_pps Float64,    -- packets per second reaching DB
-    rx_dropped_rate Float64,    -- NIC rx_dropped per second
-    rx_missed_rate Float64, -- NIC rx_missed_errors per second
-    rx_fifo_rate Float64,   -- NIC rx_fifo_errors per second
-    udp_rx_errors Float64,    -- cumulative UDP Rx errors
-    disk_avail_bytes Float64,   -- available bytes in capture dir
-    disk_io_util Float64,   -- disk I/O utilisation (0-1)
-    dumpcap_cpu_pct Float64,    -- dumpcap CPU usage %
-    nic_temp_celsius Float64,   -- NIC temperature
-    pps_drop_alert Bool     -- true if >90% PPS drop detected
+    ts                   DateTime('UTC'),
+    sensor_id            LowCardinality(String),
+    exporter_up          Nullable(UInt8),           -- node-exporter answers (NULL = not scraped)
+    problems             Array(String),
+    disk_avail_bytes     Nullable(Float64),
+    disk_size_bytes      Nullable(Float64),
+    cpu_busy_pct         Nullable(Float64),
+    mem_avail_pct        Nullable(Float64),
+    net_rx_pps           Nullable(Float64),         -- packets per second received by the NIC
+    net_drop_pps         Nullable(Float64),         -- packets per second dropped by the NIC / driver
+    softnet_drop_pps     Nullable(Float64),         -- packets per second dropped by the kernel
+    disk_io_util         Nullable(Float64),         -- busiest disk (0-1)
+    clock_synced         Nullable(UInt8),
+    clock_offset_s       Nullable(Float64),
+    -- capture nodes only
+    capture_running      Nullable(UInt8),
+    capture_cpu_pct      Nullable(Float64),
+    capture_last_loss    Nullable(UInt64),          -- packets lost by the last capture (within 7 days) that lost any, as dumpcap said when it stopped
+    units_down           Nullable(UInt16),          -- our services that are not running
+    unsent_files         Nullable(UInt32),          -- closed PCAP files not yet transferred
+    unsent_oldest_s      Nullable(UInt32)
 )
 ENGINE = MergeTree()
 PARTITION BY toYYYYMM(ts)

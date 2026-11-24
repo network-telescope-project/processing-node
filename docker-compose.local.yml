@@ -76,10 +76,12 @@ services:
     volumes:
       - clickhouse-data:/var/lib/clickhouse
       - ./docker/clickhouse/init-db:/docker-entrypoint-initdb.d:ro
+      - ./docker/clickhouse/users.d/nt-reader.xml:/etc/clickhouse-server/users.d/nt-reader.xml:ro
     environment:
       CLICKHOUSE_DB: ${CLICKHOUSE_DB:-telescope}
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-telescope}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-change_me_in_production}
+      CLICKHOUSE_RO_PASSWORD: ${CLICKHOUSE_RO_PASSWORD:-change_me_in_production}
     healthcheck:
       test: ["CMD", "clickhouse-client",
              "--user=${CLICKHOUSE_USER:-telescope}",
@@ -122,8 +124,7 @@ services:
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-change_me_in_production}
-      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-telescope}
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-change_me_in_production}
+      CLICKHOUSE_RO_PASSWORD: ${CLICKHOUSE_RO_PASSWORD:-change_me_in_production}
     ports:
       - "3000:3000"
     restart: unless-stopped

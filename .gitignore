@@ -6,6 +6,10 @@ venv
 .env
 docker/geoip
 
+# Python
+__pycache__/
+*.py[cod]
+
 # System files
 .DS_Store
 Thumbs.db

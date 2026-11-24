@@ -2,8 +2,6 @@ global:
   scrape_interval: 60s
   evaluation_interval: 60s
 
-# TODO configure Alertmanager later
-
 scrape_configs:
 
   # Prometheus self-monitoring
@@ -20,6 +18,14 @@ scrape_configs:
     relabel_configs:
       - target_label: node
         replacement: capturing
+
+  # Processing node (prometheus-node-exporter)
+  - job_name: processing-node
+    static_configs:
+      - targets: ['host.docker.internal:9100']
+    relabel_configs:
+      - target_label: node
+        replacement: processing
 
   # Processing pipeline
   - job_name: processing-pipeline

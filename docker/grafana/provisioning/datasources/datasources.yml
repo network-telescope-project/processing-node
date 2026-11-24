@@ -9,11 +9,11 @@ datasources:
     jsonData:
       host: clickhouse
       port: 9000
-      username: __CLICKHOUSE_USER__
+      username: nt_reader
       defaultDatabase: telescope
       protocol: native
     secureJsonData:
-      password: __CLICKHOUSE_PASSWORD__
+      password: $CLICKHOUSE_RO_PASSWORD
 
   - name: Prometheus
     type: prometheus

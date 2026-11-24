@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env")
 
 from prometheus_client import start_http_server as _start_metrics_server
+from src.health import alerts
 from src.parser.pcap_parser import ParseStats, PcapParser, PcapParseError
 from src.enricher.metadata_enricher import MetadataEnricher
 from src.lifecycle.data_lifecycle_manager import (
@@ -22,7 +23,8 @@ from src.lifecycle.data_lifecycle_manager import (
     PCAP_QUARANTINE_DIR,
     file_sha256,
 )
-from src.registry.sensor_registry import LOCAL_SENSOR_ID, SENSOR_ID, SensorNotReady, SensorRegistry
+from src.registry.branches import MAX_BYTES as MANIFEST_MAX_BYTES, ManifestError, parse_manifest
+from src.registry.sensor_registry import LOCAL_SENSOR_ID, SENSOR_ID, RegistryError, SensorNotReady, SensorRegistry
 from src.health.health_monitoring_manager import HealthMonitoringManager
 from src.health.ingest_watchdog import IngestWatchdog
 from src.db import get_client
@@ -40,6 +42,9 @@ POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "10"))
 READY_AGE_SECONDS = int(os.environ.get("READY_AGE_SECONDS", "5"))
 PROMETHEUS_TARGETS_FILE = os.environ.get("PROMETHEUS_TARGETS_FILE", "")
 
+conditions = alerts.Conditions("main")
+failed_files: list[str] = []
+
 
 def sensor_of(filepath: Path) -> str | None:
     """The sensor a file in the inbox came from: the sub-directory it was delivered to. A file directly in the inbox
@@ -53,6 +58,13 @@ def sensor_of(filepath: Path) -> str | None:
     if len(parts) == 2 and SENSOR_ID.match(parts[0]):
         return parts[0]
     return None
+
+
+def check_volume(filepath: Path, sensor_id: str, stats: ParseStats, inserted: int, lifecycle: DataLifecycleManager) -> None:
+    try:
+        lifecycle.check_volume(filepath, sensor_id, stats, inserted)
+    except Exception as e:
+        logger.warning(f"Could not compare the traffic volume of {filepath.name}: {e}")
 
 
 def process_pcap_file(
@@ -87,7 +99,6 @@ def process_pcap_file(
         lifecycle.remove_partial_rows(sensor_id, filepath.name)
         stats = ParseStats()
         inserted = 0
-        started = time.monotonic()
         try:
             for chunk in parser.parse_chunks(filepath, stats, INSERT_BATCH_SIZE, darknet):
                 new_sources = lifecycle.unknown_sources({p.src_ip for p in chunk})
@@ -101,11 +112,12 @@ def process_pcap_file(
         if not inserted:
             logger.info(f"No packets for the darknet in {sensor_id}/{filepath.name} ({stats.frames} frames), archiving.")
             lifecycle.log_file(filepath, sensor_id, sha256, "empty", stats)
+            check_volume(filepath, sensor_id, stats, 0, lifecycle)
             lifecycle.archive_pcap(filepath, sensor_id)
             return False
 
         lifecycle.log_file(filepath, sensor_id, sha256, "ingested", stats, inserted)
-        lifecycle.check_ingestion_speed(inserted, time.monotonic() - started)
+        check_volume(filepath, sensor_id, stats, inserted, lifecycle)
         lifecycle.archive_pcap(filepath, sensor_id)
         logger.info(
             f"Done: {sensor_id}/{filepath.name} - {inserted} packets ingested "
@@ -114,7 +126,51 @@ def process_pcap_file(
         )
     except Exception as e:
         logger.exception(f"Failed to process {sensor_id}/{filepath.name}: {e}")
+        failed_files.append(f"{sensor_id}/{filepath.name}: {str(e)[:200]}")
     return False
+
+
+def process_branch_manifest(filepath: Path, lifecycle: DataLifecycleManager, registry: SensorRegistry) -> bool:
+    """Load the branch assignment a capturing node delivered (branches_<hash>.tsv) into mgmt.ip_branches.
+    Returns True if the file was held in the inbox (sensor not ready)."""
+    sensor_id = filepath.parent.name
+    try:
+        written_at = datetime.fromtimestamp(filepath.stat().st_mtime, timezone.utc)
+        try:
+            darknet = registry.darknet_for(sensor_id, written_at)
+        except SensorNotReady as e:
+            lifecycle.report_held(sensor_id, str(e))
+            return True
+
+        sha256 = file_sha256(filepath)
+        try:
+            if filepath.stat().st_size > MANIFEST_MAX_BYTES:
+                raise ManifestError(f"larger than {MANIFEST_MAX_BYTES} bytes")
+            manifest = parse_manifest(filepath.read_text(encoding="ascii"))
+            changed = registry.import_branches(sensor_id, manifest, sha256, written_at, darknet)
+        except (ManifestError, RegistryError, UnicodeDecodeError) as e:
+            lifecycle.quarantine_pcap(filepath, sensor_id, f"branch assignment rejected: {e}", sha256)
+            return False
+
+        if changed:
+            split = ", ".join(f"{n} {branch}" for branch, n in manifest.counts().items())
+            alerts.send(
+                f"{sensor_id}: NEW BRANCH ASSIGNMENT in force from {written_at:%Y-%m-%d %H:%M:%S} UTC: "
+                f"{split} (seed {manifest.seed or '-'}, {filepath.name})",
+                logging.INFO,
+            )
+        lifecycle.archive_pcap(filepath, sensor_id)
+    except Exception as e:
+        logger.exception(f"Failed to process {sensor_id}/{filepath.name}: {e}")
+        failed_files.append(f"{sensor_id}/{filepath.name}: {str(e)[:200]}")
+    return False
+
+
+def run_jobs() -> None:
+    try:
+        schedule.run_pending()
+    except Exception as e:
+        logger.exception(f"A scheduled job failed: {e}")
 
 
 def scan_inbox(
@@ -146,7 +202,14 @@ def scan_inbox(
             candidates.add(pcap)
 
     held = 0
+    failed_files.clear()
+    # Branch assignments of the sensors, before their packets
+    for manifest in sorted(PCAP_INBOX_DIR.glob("*/branches_*.tsv")):
+        if SENSOR_ID.match(manifest.parent.name) and (now - manifest.stat().st_mtime) > READY_AGE_SECONDS:
+            held += process_branch_manifest(manifest, lifecycle, registry)
+
     for filepath in sorted(candidates):
+        run_jobs()
         sensor_id = sensor_of(filepath)
         if sensor_id is None:
             lifecycle.report_held(str(filepath.parent), f"{filepath} is neither directly in the inbox nor in a sensor sub-directory")
@@ -154,6 +217,11 @@ def scan_inbox(
             continue
         held += process_pcap_file(filepath, sensor_id, parser, enricher, lifecycle, registry)
     HELD_FILES.set(held)
+    conditions.update(
+        ("ingest",),
+        f"INGEST FAILS for {len(failed_files)} file(s), they stay in the inbox: {failed_files[0]}" if failed_files else None,
+        "ingest works again", after=6, level=logging.ERROR,
+    )
 
     # Files are removed from quarantine by hand once looked at
     lifecycle.update_quarantine_gauge()
@@ -196,6 +264,7 @@ def main() -> None:
     schedule.every(5).minutes.do(health_mgr.run)
     schedule.every(5).minutes.do(watchdog.run)
     schedule.every(5).minutes.do(sync_prometheus_targets, registry)
+    schedule.every(5).minutes.do(alerts.heartbeat)
     schedule.every().hour.do(lifecycle.maintain_archive)
 
     # Graceful shutdown
@@ -212,11 +281,12 @@ def main() -> None:
     while not shutdown["requested"]:
         try:
             scan_inbox(parser, enricher, lifecycle, registry)
-            schedule.run_pending()
         except Exception as e:
             logger.exception(f"Unexpected error in main loop: {e}")
+        run_jobs()
         time.sleep(POLL_INTERVAL_SECONDS)
 
+    alerts.flush()
     logger.info("Processing node stopped.")
 
 
