@@ -127,7 +127,7 @@ MISSING_DEPS=()
 log "Auditing PROCESSING node dependencies..."
 
 for pkg in "${SYSTEM_DEPS[@]}"; do
-    if ! dpkg -l | grep -q "ii  $pkg "; then
+    if [[ "$(dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null)" != "installed" ]]; then
         MISSING_DEPS+=("$pkg")
     fi
 done
@@ -135,7 +135,7 @@ done
 if [ ${#MISSING_DEPS[@]} -gt 0 ]; then
     warn "Missing: ${MISSING_DEPS[*]}"
     log "Updating package lists and installing missing dependencies..."
-    sudo apt update -qq && sudo apt install -y -qq "${MISSING_DEPS[@]}"
+    apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${MISSING_DEPS[@]}"
 else
     ok "System dependencies satisfied."
 fi
@@ -246,16 +246,16 @@ fi
 warn "Capturing nodes are added with scripts/add-sensor.sh"
 
 SSH_PORT="${SSH_INGEST_PORT:-8500}"
-listening() { [[ -n "$(ss -ltnH "sport = :$1")" ]]; }
+listening() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 if listening "${SSH_PORT}"; then
     ok "sshd already listens on port ${SSH_PORT}."
 else
     if systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
-        # Ubuntu socket activation
+        # Ubuntu socket activation (a bare port would listen on IPv6 only: the unit sets BindIPv6Only)
         SSH_UNIT="ssh.socket"
         SSH_DROPIN="/etc/systemd/system/ssh.socket.d/nt-transfer-port.conf"
         mkdir -p "$(dirname "${SSH_DROPIN}")"
-        printf '[Socket]\nListenStream=%s\n' "${SSH_PORT}" > "${SSH_DROPIN}"
+        printf '[Socket]\nListenStream=0.0.0.0:%s\n' "${SSH_PORT}" > "${SSH_DROPIN}"
     else
         SSH_UNIT="ssh"
         SSH_DROPIN="/etc/ssh/sshd_config.d/nt-transfer-port.conf"
@@ -395,14 +395,17 @@ ufw allow proto tcp from 172.16.0.0/12 to any port 9100 comment "nt-docker-expor
 if [[ "$(ufw status 2>/dev/null)" == "Status: active"* ]]; then
     ok "Firewall already active - rules updated."
 else
-    systemd-run --quiet --unit=nt-ufw-rollback --on-active=5min /usr/sbin/ufw disable
+    systemd-run --quiet --unit=nt-ufw-rollback /bin/sh -c 'sleep 300; /usr/sbin/ufw disable'
     ufw --force enable > /dev/null
     warn "Firewall enabled; it disables itself in 5 minutes unless you confirm."
     warn "Open a NEW ssh session to this node now (keep this one open), then answer here."
     read -r -p "Does the new session work? [y/N] " ANSWER
-    systemctl stop nt-ufw-rollback.timer
-    if [[ "${ANSWER}" =~ ^[Yy]$ ]]; then
+    systemctl stop nt-ufw-rollback 2>/dev/null || true
+    if [[ "${ANSWER}" =~ ^[Yy]$ && "$(ufw status 2>/dev/null)" == "Status: active"* ]]; then
         ok "Firewall confirmed."
+    elif [[ "${ANSWER}" =~ ^[Yy]$ ]]; then
+        err "The 5 minutes had already passed and the firewall disabled itself - re-run setup.sh."
+        exit 1
     else
         ufw disable > /dev/null
         err "Firewall disabled again. Fix MGMT_ALLOW_FROM in ${ENV_FILE} and re-run setup.sh."
@@ -410,7 +413,8 @@ else
     fi
 fi
 
-ok "\n[DONE] Processing node setup is done."
+echo ""
+ok "Processing node setup is done."
 echo ""
 echo -e "\033[1;33mNext steps:\033[0m"
 echo -e "\033[1;33m   1. Edit ${ENV_FILE}\033[0m"

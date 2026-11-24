@@ -210,7 +210,7 @@ for edition in GeoLite2-City GeoLite2-ASN; do
 done
 
 # --Transfer port-------------------------------------------------------------
-if [[ -n "$(ss -ltnH "sport = :${SSH_INGEST_PORT:-8500}")" ]]; then
+if (exec 3<>"/dev/tcp/127.0.0.1/${SSH_INGEST_PORT:-8500}") 2>/dev/null; then
     ok "sshd listens on the transfer port ${SSH_INGEST_PORT:-8500}"
 else
     err "Nothing listens on the transfer port ${SSH_INGEST_PORT:-8500} - run setup.sh"
